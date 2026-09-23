@@ -14,6 +14,7 @@ META_SCHEMA = "meta"  # 메타(코드마스터, DQ결과 등) 관리용 스키�
 CODE_MASTER_TABLE = f"{UC_CATALOG}.{META_SCHEMA}.code_master"
 DQ_RESULT_TABLE = f"{UC_CATALOG}.{META_SCHEMA}.dq_result"
 DQ_CLEANSING_DETAIL_TABLE = f"{UC_CATALOG}.{META_SCHEMA}.dq_cleansing_detail"  # 요청서 4장 - 행 단위 상세
+DQ_RULE_DEF_TABLE = f"{UC_CATALOG}.{META_SCHEMA}.dq_rule_def"   # DQ 규칙 정의 (정본, 규칙 단위 버전 관리 - 추가 전용)
 # DQ 기준서 8.7 - 승인된 Source -> Standard 코드 매핑표 (CLN-VAL-003 전용)
 # 필수 컬럼: CODE_GROUP, SOURCE_CODE, STANDARD_CODE, APPROVED_YN('Y'만 사용)
 CODE_MAPPING_TABLE = f"{UC_CATALOG}.{META_SCHEMA}.code_mapping"
@@ -39,10 +40,13 @@ def quarantine_table(source_system: str) -> str:
     return f"{UC_CATALOG}.{QUARANTINE_SCHEMA_NAME}.{source_system}"
 
 
-# 지금 DQ_RULES는 버전 관리를 Rule 단위로 하지 않는다 (44개 각각 버전을 손으로 올리면
-# 실수로 깜빡하기 쉬움). 대신 DQ_RULES 리스트 전체를 하나의 버전으로 보고, 여기 숫자만
-# 올리면 이번 실행부터 모든 dq_result 행에 새 버전이 찍힌다.
+# DQ 규칙의 정본은 meta.dq_rule_def 테이블이다 (규칙마다 rule_version이 있고, 내용이 바뀌면 자동으로 올라간다).
+# 이 값은 코드의 DQ_RULES로 실행하는 경우(DQRunner rule_source="code": 테스트·비교용)의 기본 버전일 뿐이다.
 DQ_RULES_VERSION = 1
+
+# 규칙 정의 검증용 허용값 (dq_rule_repository가 CSV/테이블 적재 전에 검사한다)
+RULE_TYPES = ("NULL_CHECK", "PATTERN_CHECK", "RANGE_CHECK", "ORDER_CHECK", "CODE_EXISTS", "DUPLICATE_CHECK")
+ERROR_GRADES = ("CRITICAL", "HIGH", "MEDIUM", "LOW", "REVIEW")
 
 # dq_cleansing_detail/silver_candidate에서 "이 레코드가 무엇인지"를 가리키는 컬럼.
 # 업무키가 애매한 outbound(CTI_ID로 사용 - LEAD_MGMT_NO는 DUPLICATE_CHECK 대상이라 다름)를
@@ -204,6 +208,10 @@ TIMESTAMP_STANDARD_FORMAT = "yyyy-MM-dd HH:mm:ss"
 
 # -------------------------------------------------------------------------
 # DQ Rules Definition (실제 테이블 스키마 기반 반영)
+#
+# 이 리스트는 "초기 적재용 원본(seed)"이자 rule_source="code" 실행용이다. 운영 정본은 meta.dq_rule_def 테이블이며,
+# 규칙을 바꿀 때는 Volume의 CSV를 고쳐 dq_rule_loader로 적재한다 (코드 배포 불필요, 버전 이력이 남는다).
+# 이 파일의 DQ_RULES를 고쳐도 테이블은 바뀌지 않는다.
 # -------------------------------------------------------------------------
 DQ_RULES = [
     # =====================================================================
@@ -323,9 +331,12 @@ DQ_RULES = [
     },
     {
         "rule_id": "DQ-CON-OUT-001",
-        "rule_name": "Outbound 시각 체인 순서 검사",
+        "rule_name": "Outbound 통화시작/연결 시각 순서 검사",
         "target_table": f"{UC_CATALOG}.{BRONZE_SCHEMA}.outbound",
-        "columns": ["CALL_ST_DTM", "CALL_CONN_DTM", "CALL_END_DTM"],
+        # 기준서 §7.2는 CALL_ST ≤ CONN ≤ END 체인이지만 ORDER_CHECK 구현(check_start_end_order, row_error_expr)은 앞의 2개 컬럼만 비교한다.
+        # 이전에는 3개로 선언해 두고 CALL_END_DTM을 조용히 무시했으므로, 정의를 실제 검사와 일치시켰다 (검사 동작은 그대로).
+        # "연결 ≤ 종료" 검사는 미연결 통화(CALL_CONN_DTM NULL)를 오류로 볼지 정한 뒤 별도 규칙으로 추가한다.
+        "columns": ["CALL_ST_DTM", "CALL_CONN_DTM"],
         "rule_type": "ORDER_CHECK",
         "dimension": "일관성",
         "threshold_rate": 0.0,
@@ -653,6 +664,23 @@ def validate_cleansing_config() -> None:
                 raise ValueError(f"'{rule_id}'의 step '{step}'가 CLEANSING_RULES에 정의되어 있지 않습니다.")
         if cfg.get("datetime_kind", "TIMESTAMP") not in ("DATE", "TIMESTAMP"):
             raise ValueError(f"'{rule_id}'의 datetime_kind는 DATE/TIMESTAMP 중 하나여야 합니다.")
+
+
+def cleansing_config_for(rule: dict):
+    """
+    Rule에 붙은 자동 Cleansing 설정을 돌려준다 (없으면 None).
+      - 테이블(meta.dq_rule_def)에서 읽은 Rule: rule["cleansing_steps"] (리스트, 비어 있으면 정제 없음)
+      - 코드(DQ_RULES)로 실행하는 Rule: CLEANSING_RULE_MAPPING
+    """
+    if "cleansing_steps" in rule:
+        steps = list(rule["cleansing_steps"] or [])
+        if not steps:
+            return None
+        cfg = {"steps": steps}
+        if rule.get("datetime_kind"):
+            cfg["datetime_kind"] = rule["datetime_kind"]
+        return cfg
+    return CLEANSING_RULE_MAPPING.get(rule["rule_id"])
 
 
 validate_cleansing_config()

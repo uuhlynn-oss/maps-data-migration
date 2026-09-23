@@ -1,9 +1,9 @@
 """
-Silver -> Gold Mapping Execution 엔진 (슬라이스 1: 최소 구현)
+Silver -> Gold Mapping Execution 엔진.
 
 역할
     Mapping Definition(메타데이터)을 읽어 Silver 데이터를 Target 모양(gold_candidate)으로 변환한다.
-    Target Validation과 gold_quarantine은 이 다음 단계이며, 이 엔진은 그 입력이 될 표시만 남긴다.
+    Target Validation과 gold_quarantine(gold_validation_runner.py)이 이 다음 단계이며, 이 엔진은 그 입력이 될 표시만 남긴다.
         _map_errors      값 변환에 실패한 Target 컬럼 (예: 시각 형식이 맞지 않음)
         _unmapped_codes  승인된 코드 매핑이 없어 NULL이 된 값 (예: CNSL_TYPE_CD=CON_099)
 
@@ -99,6 +99,8 @@ class MappingEngine:
         return rows
 
     def _load_definitions(self, source_system: str, target_table: str) -> List[Dict[str, Any]]:
+        # mapping_seed_loader.py가 적재 시 MAPPING_ID 중복을 이미 거부하므로, 여기서는 버전 선택 없이 그대로 모은다.
+        # (mapping_definition이 dq_rule_def처럼 진짜 버전 관리 테이블이 되면, 그때 "최신 버전만 선택"을 다시 넣는다.)
         df = (
             self._defs
             .filter(F.upper(F.trim(F.col("SOURCE_SYSTEM"))) == source_system.upper())
@@ -106,13 +108,8 @@ class MappingEngine:
             .filter(F.upper(F.trim(F.col("FINAL_MIGRATION_APPLY_YN"))) == "Y")
             .filter(F.upper(F.trim(F.col("REVIEW_STATUS"))).isin(*cfg.APPLY_REVIEW_STATUSES))
         )
-        latest: Dict[str, Dict[str, Any]] = {}
-        for r in df.collect():
-            d = {k: (v.strip() if isinstance(v, str) else v) for k, v in r.asDict().items()}
-            prev = latest.get(d["MAPPING_ID"])
-            if prev is None or _ver(d["VERSION"]) > _ver(prev["VERSION"]):
-                latest[d["MAPPING_ID"]] = d   # 같은 MAPPING_ID가 여러 버전이면 가장 높은 버전만 쓴다
-        return sorted(latest.values(), key=lambda d: d["MAPPING_ID"])
+        defs = [{k: (v.strip() if isinstance(v, str) else v) for k, v in r.asDict().items()} for r in df.collect()]
+        return sorted(defs, key=lambda d: d["MAPPING_ID"])
 
     def _code_entries(self, code_mapping_system: str, source_column: str, target_group: str) -> Dict[str, str]:
         """승인(APPROVED)되고 TARGET_CODE가 있는 AS-IS -> TO-BE 코드만. 한 코드가 서로 다른 Target으로 가면 정의 오류."""
@@ -197,10 +194,13 @@ class MappingEngine:
 
     def _dispatch(self, d, stype) -> Optional[Callable]:
         key = (str(d["MAPPING_TYPE"]).upper(), str(d["PROCESS_TYPE"]).upper())
+        # Target이 timestamp면 선언된 MAPPING_TYPE(TRANSFORM/FORMAT 뿐 아니라 DIRECT/COPY, RENAME/COPY도)과 무관하게
+        # 항상 시간대를 명시해 파싱한다. _copy가 먼저 걸리면 F.col(...).cast("timestamp")로 세션 시간대에 의존하게 되어
+        # KST 원본이 변환 없이 그대로 들어가는 사고(아웃바운드 CALL_ST_DTM/CALL_END_DTM이 DIRECT/COPY로 선언된 경우 실제 재현됨)가 난다.
+        if stype == "timestamp" and key in (("RENAME", "COPY"), ("DIRECT", "COPY"), ("TRANSFORM", "FORMAT")):
+            return self._format_timestamp
         if key in (("RENAME", "COPY"), ("DIRECT", "COPY")):
             return self._copy
-        if key == ("TRANSFORM", "FORMAT") and stype == "timestamp":
-            return self._format_timestamp
         if key == ("CODE", "LOOKUP"):
             return self._code_lookup
         if key == ("DERIVED", "CONSTANT"):
@@ -210,6 +210,46 @@ class MappingEngine:
     # ------------------------------------------------------------------
     # 실행
     # ------------------------------------------------------------------
+    def discover_target_tables(self) -> List[str]:
+        """meta.mapping_definition에 승인된 매핑이 있는 Target 중, 이 엔진이 지금 실행 가능한 것만 돌려준다.
+        메타데이터에 있는 Target을 그대로 다 내보내지 않고 cfg.SUPPORTED_TARGET_TABLES와 교집합을 취하는 게 핵심이다.
+        1:1 변환만 지원하는 이 엔진으로 CUSTOMER/CONTRACT(여러 소스 행이 하나로 합쳐져야 하는 테이블)를 그냥 실행하면
+        레코드가 중복되거나 빈 행이 생긴다(실제로 재현된 문제). SUPPORTED_TARGET_TABLES가 그 사고를 막는 장치이므로,
+        자동 탐색이 이 장치를 우회하지 않도록 여기서 항상 교집합을 취한다.
+
+        정렬은 알파벳순이 아니라 mapping_definition.TARGET_LOAD_ORDER 기준이다 (10 상품/코드, 20 CUSTOMER, 30 CONTRACT,
+        40 COUNSEL, ...). CONTRACT가 CUSTOMER를 NOT NULL FK로 참조하는 등 Target 간 참조 관계가 있어서, 알파벳순으로
+        돌리면(CONTRACT가 CUSTOMER보다 먼저) 부모가 없는 상태에서 자식을 실행하게 된다."""
+        rows = (
+            self._defs
+            .filter(F.upper(F.trim(F.col("FINAL_MIGRATION_APPLY_YN"))) == "Y")
+            .filter(F.upper(F.trim(F.col("REVIEW_STATUS"))).isin(*cfg.APPLY_REVIEW_STATUSES))
+            .select(F.upper(F.trim(F.col("TARGET_TABLE"))).alias("t"), F.col("TARGET_LOAD_ORDER").alias("o"))
+            .distinct().collect()
+        )
+        order_by_target: Dict[str, float] = {}
+        for r in rows:
+            o = _ver(r["o"])   # 같은 Target이 여러 행에 걸쳐 있어도 보통 값이 하나다. 혹시 다르면 더 이른(작은) 순서를 취한다.
+            if r["t"] not in order_by_target or o < order_by_target[r["t"]]:
+                order_by_target[r["t"]] = o
+        found = set(order_by_target)
+        supported = [t for t in cfg.SUPPORTED_TARGET_TABLES if t in found]
+        return sorted(supported, key=lambda t: (order_by_target[t], t))
+
+    def discover_sources(self, target_table: str) -> List[str]:
+        """이 Target으로 승인된 매핑(FINAL_MIGRATION_APPLY_YN=Y, REVIEW_STATUS 승인)이 있는 소스 목록을 meta.mapping_definition에서
+        확정한다. 노트북에 소스를 하드코딩하지 않고, 정의가 바뀌면(새 소스 추가·제외) 이 목록도 같이 바뀌게 하기 위함."""
+        target_table = target_table.upper()
+        rows = (
+            self._defs
+            .filter(F.upper(F.trim(F.col("TARGET_TABLE"))) == target_table)
+            .filter(F.upper(F.trim(F.col("FINAL_MIGRATION_APPLY_YN"))) == "Y")
+            .filter(F.upper(F.trim(F.col("REVIEW_STATUS"))).isin(*cfg.APPLY_REVIEW_STATUSES))
+            .select(F.upper(F.trim(F.col("SOURCE_SYSTEM"))).alias("s")).distinct().collect()
+        )
+        found = {r["s"] for r in rows}
+        return sorted(s for s in cfg.SOURCE_SYSTEMS if s in found)   # SOURCE_SYSTEMS에 등록된 순서를 따른다 (안정적인 실행 순서)
+
     def run(self, source_system: str, target_table: str, silver_df: Optional[DataFrame] = None,
             source_batch_id: Optional[str] = None) -> Tuple[DataFrame, Dict[str, Any]]:
         """
@@ -329,8 +369,9 @@ class MappingEngine:
             "unmapped_codes": unmapped_by_value,               # {"CNSL_TYPE_CD=CON_099": 4, ...}
         }
 
-    # ------------------------------------------------------------------
-    # 저장 (gold_candidate.<target>, 같은 소스·배치만 교체)
+    # 저장: gold_candidate.<target> 물리 테이블에 같은 소스·배치만 교체 (기본 흐름).
+    # 서버리스는 전역 임시 뷰를 지원하지 않고 세션 간 데이터 전달에 물리 테이블/세션 임시 뷰를 권장하므로,
+    # 노트북이 분리돼 있어도 이어지도록 처음부터 물리 테이블로 간다.
     # ------------------------------------------------------------------
     def save(self, candidate: DataFrame, summary: Dict[str, Any]) -> str:
         table = cfg.gold_candidate_table(summary["target_table"])

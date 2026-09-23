@@ -1,9 +1,24 @@
+"""
+DQ 검사·정제 순수 함수 모음. Spark Column을 받아 Column을 돌려주는 함수들이고, 클래스/실행 상태가 없다.
+    - 검사 함수: PII 마스킹, Rule 6종(NULL/PATTERN/RANGE/ORDER/CODE/DUPLICATE)의 행 단위 오류 조건
+    - 정제 함수: CLN-* 규칙 각각의 "before Column -> after Column" 변환 (같은 입력은 항상 같은 결과, 부작용 없음)
+실행(재-DQ 판정, 규칙 저장소, 결과 리포트, 전체 조립)은 dq_engine.py에 있다.
+"""
 import re
+from typing import Any, Dict, List
+
 from pyspark.sql import Column, DataFrame, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import StringType
-from typing import Dict, Any
 
+try:
+    import src.dq.dq_config as dq_config
+except ModuleNotFoundError:
+    import dq_config
+
+
+# 1. 검사 함수
+# =============================================================================
 # -------------------------------------------------------------------------
 # 종옥님 요청서 4.4: 개인정보/민감정보는 Review UI에 원문으로 노출하지 않는다.
 # 컬럼별 화이트리스트를 따로 관리하지 않고, 샘플 문자열이 이메일/전화번호
@@ -171,7 +186,7 @@ def check_pattern(df: DataFrame, rule: Dict[str, Any], record_key_col: str = Non
         "sample_values": sample_values,
         "dq_reason": f"Column '{col_name}' does not match pattern '{pattern}'.",
         "detail_df": _build_detail_df(error_df, record_key_col, col_name, [col_name]),
-        # 자동 Cleansing(dq_cleansing.py)이 마스킹 전 원문 값을 써야 해서 오류 행 원본도 함께 넘긴다 (lazy DataFrame이라 추가 비용 없음)
+        # 자동 정제(2번 섹션의 CleansingEngine)가 마스킹 전 원문 값을 써야 해서 오류 행 원본도 함께 넘긴다 (lazy DataFrame이라 추가 비용 없음)
         "error_df": error_df,
     }
 
@@ -273,3 +288,83 @@ def check_duplicate(df: DataFrame, rule: Dict[str, Any], record_key_col: str = N
         "detail_df": detail_df,
         "error_df": affected_rows_df,
     }
+
+# =============================================================================
+# 2. 정제 변환 함수 (CleansingEngine이 dq_engine.py에서 이 함수들을 불러 쓴다)
+# =============================================================================
+"""
+자동 Cleansing 엔진 (DQ 기준서 8장 구현)
+
+흐름 (8.10)
+    DQ ERROR 행 -> Cleansing Rule 확인 -> 자동 Cleansing -> 재-DQ
+        재-DQ PASS -> AUTO_CLEANSED (Silver 후보에 정제값 반영)
+        재-DQ FAIL -> 정제 실패 (re_dq_result='FAIL'). 남은 위반의 처리는 Rule의 action_type이 정한다 (기준서 §4)
+            BLOCK/REVIEW -> UNRESOLVED (격리)   /   WARN -> ALLOWED (허용, 로그만)
+    Cleansing Rule이 없는 오류는 이 모듈을 거치지 않고 dq_runner에서 같은 기준으로 분류한다.
+    DQ 단계에는 HITL이 없다. (AI+HITL은 Gold -> Target 단계)
+
+설계 원칙
+    - 변환 함수는 전부 "Column -> Column" 순수 함수다. 같은 입력은 항상 같은 결과가 나오고(8.2.1/8.2.2),
+      변환할 수 없는 값은 "원본 그대로" 돌려준다 -> 재-DQ에서 자연스럽게 FAIL -> UNRESOLVED/ALLOWED.
+    - 값을 새로 만들지 않는다. NULL을 채우거나, 모르는 코드를 ETC로 바꾸는 일은 하지 않는다 (8.2.3).
+    - 재-DQ는 원래 DQ Rule과 "같은 오류 조건"으로 판정한다 (pattern_error / code_error 공용).
+    - dq_cleansing_detail에 저장하는 before/proposed/final 값은 _mask_udf로 마스킹한다 (요청서 4.4).
+      마스킹 전 원문은 Silver 후보(silver_candidate) 정제에만 쓰인다.
+"""
+
+
+# =========================================================================
+# 개별 변환 함수 (Column -> Column, 문자열 기준)
+# =========================================================================
+def cln_com_001_whitespace(c: Column) -> Column:
+    """CLN-COM-001 공백 정규화: 앞뒤 공백 제거, 공백-only 값은 NULL. NULL은 NULL 그대로 둔다(8.4)."""
+    # Spark trim()은 일반 공백(0x20)만 지우므로 탭/줄바꿈/NBSP/전각공백까지 정규식으로 처리한다.
+    trimmed = F.regexp_replace(c, r"^[\s\u00A0\u3000]+|[\s\u00A0\u3000]+$", "")
+    return F.when(trimmed == "", F.lit(None).cast("string")).otherwise(trimmed)
+
+
+def cln_val_001_phone(c: Column) -> Column:
+    """
+    CLN-VAL-001 전화번호 표준화.
+    숫자 + 허용 구분자(공백/점/하이픈)만으로 이루어진 휴대전화번호(01X + 7~8자리)만 변환한다.
+    영문이 섞인 값, +82 같은 국가번호 변환은 업무 의미가 바뀔 수 있으므로 손대지 않는다(8.5-4).
+    """
+    sep = dq_config.PHONE_SEPARATOR_REGEX
+    only_digits_and_separators = c.rlike(rf"^(?:[0-9]|{sep})+$")
+    digits = F.regexp_replace(c, sep, "")
+    is_mobile = digits.rlike(r"^01[0-9][0-9]{7,8}$")
+
+    if dq_config.PHONE_STANDARD_FORMAT == "DIGITS":
+        formatted = digits  # 구분자만 제거 (표준)
+    else:  # "HYPHEN": 11자리 -> 3-4-4, 10자리 -> 3-3-4 (greedy 뒤 backtrack 으로 자동 결정)
+        formatted = F.regexp_replace(digits, r"^(01[0-9])([0-9]{3,4})([0-9]{4})$", "$1-$2-$3")
+
+    return F.when(only_digits_and_separators & is_mobile, formatted).otherwise(c)
+
+
+def cln_val_002_datetime(c: Column, kind: str = "TIMESTAMP") -> Column:
+    """
+    CLN-VAL-002 날짜/시간 표준화.
+    dq_config.*_INPUT_FORMATS 중 하나로 "정확히" 파싱되는 값만 표준 형식 문자열로 바꾼다.
+    2026/13/40 같은 잘못된 날짜, '알 수 없음' 같은 값은 파싱에 실패하므로 원본 그대로 남는다(8.6-4).
+    (Databricks 서버리스는 ANSI 모드라 to_timestamp는 오류를 던지므로 try_to_timestamp를 쓴다)
+    """
+    if kind == "DATE":
+        in_formats, out_format = dq_config.DATE_INPUT_FORMATS, dq_config.DATE_STANDARD_FORMAT
+    else:
+        in_formats, out_format = dq_config.TIMESTAMP_INPUT_FORMATS, dq_config.TIMESTAMP_STANDARD_FORMAT
+
+    parsed = F.coalesce(*[F.try_to_timestamp(c, F.lit(fmt)) for fmt in in_formats])
+    return F.when(parsed.isNotNull(), F.date_format(parsed, out_format)).otherwise(c)
+
+
+def cln_val_003_code_mapping(c: Column, mapping: Dict[str, str]) -> Column:
+    """
+    CLN-VAL-003 승인된 코드값 표준화.
+    mapping은 "승인됨 + Source 1개당 Standard 1개 + Standard가 code_master에 존재"를 모두 통과한 것만 들어온다.
+    매핑에 없는 값(예: CON_099, PLAN, 미분류)은 원본 그대로 둔다 -> 재-DQ FAIL -> 미해결.
+    """
+    if not mapping:
+        return c
+    mapped = F.coalesce(*[F.when(c == F.lit(src), F.lit(std)) for src, std in mapping.items()])
+    return F.coalesce(mapped, c)

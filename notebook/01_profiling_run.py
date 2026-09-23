@@ -18,10 +18,10 @@ from pyspark.sql import functions as F
 # # Spark 세션 시간대 설정 안함 - 기본 UTC 기준으로 진행
 # spark.conf.set("spark.sql.session.timeZone", "Asia/Seoul")
 
-# print(
-#     "Spark Session Timezone:",
-#     spark.conf.get("spark.sql.session.timeZone")
-# )
+print(
+     "Spark Session Timezone:",
+     spark.conf.get("spark.sql.session.timeZone")
+ )
 
 # COMMAND ----------
 

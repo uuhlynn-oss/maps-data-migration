@@ -70,18 +70,6 @@ INGEST_TARGETS = {
 
 # COMMAND ----------
 
-from pyspark.sql import functions as F
-
-# Spark 세션 시간대 설정
-spark.conf.set("spark.sql.session.timeZone", "Asia/Seoul")
-
-print(
-    "Spark Session Timezone:",
-    spark.conf.get("spark.sql.session.timeZone")
-)
-
-# COMMAND ----------
-
 print("Starting Bronze Load Job...")
 for source_name, config in INGEST_TARGETS.items():
     ingest_to_bronze(spark, dbutils, source_name, config)

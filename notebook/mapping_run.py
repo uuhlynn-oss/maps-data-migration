@@ -18,7 +18,7 @@
 # COMMAND ----------
 
 # 파라미터 (여기만 바꿔서 실행)
-SOURCE_SYSTEM = "INBOUND"     # 매핑 정의의 SOURCE_SYSTEM
+SOURCE_SYSTEM = "OUTBOUND"     # 매핑 정의의 SOURCE_SYSTEM
 TARGET_TABLE = "COUNSEL"      # 현재 지원: COUNSEL (소스 1행 = Target 1행인 테이블만)
 SOURCE_BATCH_ID = None        # None이면 silver_candidate의 최신 배치
 SAVE_CANDIDATE = True         # gold_candidate.<target>에 저장 (후보를 뷰로 할지 물리 테이블로 할지 정하기 전의 확인용)
@@ -127,40 +127,7 @@ _show(candidate.select("CNSL_ID", "CNSL_TYPE_CD", "CNSL_CHNL_CD", "CNSL_ST_CD", 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 4. 시각 변환 독립 검증 (KST 문자열 → UTC)
-# MAGIC 엔진 코드와 별개로 파이썬(`zoneinfo`)이 계산한 UTC 시각과 비교합니다. 세션 시간대와 무관합니다.
-
-# COMMAND ----------
-
-PY_TS_FORMAT = "%Y-%m-%d %H:%M:%S"     # cfg.SOURCE_TIMESTAMP_FORMAT(yyyy-MM-dd HH:mm:ss)과 같은 형식
-if "STRT_DTM" in summary["applied_columns"]:
-    src_tz = cfg.SOURCE_TIMEZONE.get(SOURCE_SYSTEM.upper(), cfg.DEFAULT_SOURCE_TIMEZONE)
-    silver = (
-        spark.read.table(silver_table)
-        .filter(F.col("_source_batch_id") == summary["source_batch_id"])
-        .select(F.col("consultation_id").alias("CNSL_ID"), "started_at")
-    )
-    rows = (
-        candidate.filter(F.col("STRT_DTM").isNotNull())
-        .select("CNSL_ID", F.unix_timestamp("STRT_DTM").alias("epoch"))
-        .join(silver, "CNSL_ID").limit(200).collect()
-    )
-    bad = []
-    for r in rows:
-        expected = (datetime.datetime.strptime(r["started_at"].strip(), PY_TS_FORMAT)
-                    .replace(tzinfo=ZoneInfo(src_tz)).astimezone(datetime.timezone.utc))
-        if int(expected.timestamp()) != r["epoch"]:
-            bad.append((r["CNSL_ID"], r["started_at"], expected.strftime("%Y-%m-%d %H:%M:%S UTC")))
-    print(f"원천 시간대 {src_tz} → UTC, 검사 {len(rows)}건: " + ("✅ 모두 일치" if not bad else f"❌ 불일치 {len(bad)}건"))
-    for b in bad[:5]:
-        print("   ", b)
-    for r in rows[:3]:
-        print(f"    예) {r['CNSL_ID']}: 원천 {r['started_at']} ({src_tz}) → UTC {datetime.datetime.fromtimestamp(r['epoch'], datetime.timezone.utc):%Y-%m-%d %H:%M:%S}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 5. Target 컬럼별 NULL 비율과 코드 분포
+# MAGIC ## 4. Target 컬럼별 NULL 비율과 코드 분포
 # MAGIC 보류 컬럼(CUST_ID, PRD_ID 등)은 100% NULL이 정상입니다. 적용 컬럼의 NULL이 예상보다 많으면 원인을 확인하세요.
 
 # COMMAND ----------
@@ -198,9 +165,5 @@ else:
 
 # COMMAND ----------
 
-
-
-# COMMAND ----------
-
 # MAGIC %sql
-# MAGIC select count(*) from maps_databricks.silver_candidate.homepage
+# MAGIC    SELECT CTI_ID, COUNT(*) FROM maps_databricks.silver_candidate.outbound GROUP BY CTI_ID HAVING COUNT(*) > 1;
