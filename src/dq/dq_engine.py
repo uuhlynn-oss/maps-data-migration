@@ -280,8 +280,6 @@ class CleansingEngine:
 # =============================================================================
 # 2. 규칙 저장소
 # =============================================================================
-# 3. 규칙 저장소
-# =============================================================================
 """
 DQ 규칙 저장소 - 규칙 정의(파라미터)를 코드가 아니라 버전 관리되는 meta 테이블(meta.dq_rule_def)에서 읽는다.
 
@@ -377,38 +375,6 @@ def normalize_input(raw: Dict[str, Any]) -> Dict[str, Any]:
     return item
 
 
-def rule_to_input(rule: Dict[str, Any]) -> Dict[str, Any]:
-    """코드의 DQ_RULES 한 항목(+CLEANSING_RULE_MAPPING)을 입력 형식으로 바꾼다 (초기 적재용 CSV 만들기, 테스트 데이터 구성)."""
-    cols = rule.get("columns") or [rule["column"]]
-    cfg = dq_config.cleansing_config_for(rule) or {}
-    return normalize_input({
-        "rule_id": rule["rule_id"], "rule_name": rule.get("rule_name"), "target_table": rule["target_table"],
-        "rule_type": rule["rule_type"], "target_columns": ",".join(cols), "pattern": rule.get("pattern"),
-        "min_value": rule.get("min_value"), "max_value": rule.get("max_value"), "code_group": rule.get("code_group"),
-        "dimension": rule.get("dimension"), "threshold_rate": rule.get("threshold_rate"), "error_grade": rule.get("error_grade"),
-        "cleansing_steps": ",".join(cfg.get("steps", [])), "datetime_kind": cfg.get("datetime_kind"), "change_reason": None,
-    })
-
-
-def code_rules_as_inputs(rules: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
-    return [rule_to_input(r) for r in (rules if rules is not None else dq_config.DQ_RULES)]
-
-
-def export_code_rules_to_csv(path: str, rules: Optional[List[Dict[str, Any]]] = None,
-                             change_reason: str = "초기 적재 (dq_config.DQ_RULES)") -> int:
-    """코드의 규칙을 적재용 CSV(UTF-8 BOM)로 내보낸다. 처음 한 번 Volume에 올릴 파일을 만들 때 쓴다."""
-    import csv
-    items = code_rules_as_inputs(rules)
-    with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=INPUT_COLUMNS)
-        w.writeheader()
-        for it in items:
-            row = {k: ("" if v is None else v) for k, v in it.items()}
-            row["change_reason"] = change_reason
-            w.writerow(row)
-    return len(items)
-
-
 # ---------------------------------------------------------------------------
 # 검증 (하나라도 틀리면 아무것도 적재하지 않고 모든 오류를 한꺼번에 알려 준다)
 # ---------------------------------------------------------------------------
@@ -485,7 +451,7 @@ def compute_hash(item: Dict[str, Any]) -> str:
 
 
 def row_to_rule(row: Dict[str, Any]) -> Dict[str, Any]:
-    """테이블 한 행을 러너가 쓰는 규칙 딕셔너리(DQ_RULES와 같은 모양 + rule_version, cleansing_steps)로 바꾼다."""
+    """테이블 한 행을 러너가 쓰는 규칙 딕셔너리(rule_version, cleansing_steps 포함)로 바꾼다."""
     cols = _split_csv(row["target_columns"])
     rule = {
         "rule_id": row["rule_id"], "rule_name": row.get("rule_name") or "", "target_table": row["target_table"],
@@ -649,8 +615,6 @@ class RuleRepository:
 
 # =============================================================================
 # 3. 결과 리포트
-# =============================================================================
-# 4. 결과 리포트
 # =============================================================================
 class DQResultBuilder:
     """
@@ -863,24 +827,17 @@ class DQResultBuilder:
 # =============================================================================
 # 4. 실행기
 # =============================================================================
-# 5. 실행기
-# =============================================================================
 class DQRunner:
     """MAPS DQ Rule을 실행하고 판정 및 결과 적재를 수행합니다."""
 
-    def __init__(self, spark: SparkSession, dbutils: Any = None, rule_source: str = "table",
-                 rule_table: Optional[str] = None):
+    def __init__(self, spark: SparkSession, dbutils: Any = None, rule_table: Optional[str] = None):
         """
-        rule_source="table": meta.dq_rule_def(정본)에서 규칙별 최신 활성 버전을 읽어 실행한다 (운영).
-        rule_source="code":  코드의 dq_config.DQ_RULES로 실행한다 (테스트·비교용, 버전은 DQ_RULES_VERSION).
+        meta.dq_rule_def(정본)에서 규칙별 최신 활성 버전을 읽어 실행한다.
         rule_table: 규칙 테이블 경로를 바꿔 쓸 때만 지정 (검증 셀의 dq_test 스키마 등).
         """
-        if rule_source not in ("table", "code"):
-            raise ValueError("rule_source는 'table' 또는 'code'여야 합니다.")
         self.spark = spark
         self.dbutils = dbutils
-        self.rule_source = rule_source
-        self.rule_repo = RuleRepository(spark, rule_table) if rule_source == "table" else None
+        self.rule_repo = RuleRepository(spark, rule_table)
         self.code_master_df: Optional[DataFrame] = None
         # dq_run_id는 run_table_dq() 호출마다(= 소스 테이블 × 실행마다) 새로 발급한다 (요청서 §7-3).
         # 여기 값은 execute_rule()을 run_table_dq() 밖에서 직접 호출할 때를 위한 기본값이다.
@@ -889,9 +846,7 @@ class DQRunner:
         self.cleansing = CleansingEngine(spark, self._load_code_master)
 
     def _load_rules(self, target_table: str) -> List[Dict[str, Any]]:
-        """이번 실행에 쓸 규칙을 읽는다. 테이블 모드에서는 규칙이 없거나 테이블이 없으면 조용히 코드 규칙으로 대체하지 않고 멈춘다."""
-        if self.rule_source == "code":
-            return [r for r in dq_config.DQ_RULES if r["target_table"] == target_table]
+        """이번 실행에 쓸 규칙을 meta.dq_rule_def에서 읽는다. 규칙이 없거나 테이블이 없으면 여기서 멈춘다."""
         rules = self.rule_repo.load_current(target_table)
         if rules:
             versions = sorted({r["rule_version"] for r in rules})
@@ -956,7 +911,7 @@ class DQRunner:
         target_table = rule["target_table"]
 
         # target_table = "maps_databricks.bronze.inbound" 형태라 마지막 조각이 곧 소스명이다.
-        # DQ_RULES에 source_system 필드를 따로 안 넣어도 되게 여기서 바로 유추한다.
+        # 규칙에 source_system 필드를 따로 안 넣어도 되게 여기서 바로 유추한다.
         source_system = target_table.split(".")[-1]
         # dq_cleansing_detail/silver_candidate에서 이 레코드를 가리킬 업무키 컬럼.
         # 정의 안 된 테이블이면 None -> _build_detail_df가 알아서 NULL로 채운다.
@@ -1071,7 +1026,7 @@ class DQRunner:
             # ---- 요청서 반영분 ----
             "dq_run_id": self.dq_run_id,
             "source_system": source_system,
-            "dq_rule_version": rule.get("rule_version", dq_config.DQ_RULES_VERSION),   # 이 규칙 자체의 버전 (코드 규칙은 기본 버전)
+            "dq_rule_version": rule["rule_version"],   # 이 규칙 자체의 버전 (meta.dq_rule_def 기준)
             "unique_error_record_count": unique_error_record_count,
             # cleansing_required_yn: action_type 기준 매핑. 매핑표에 없는 값이 나오면(향후 등급 추가 등)
             # 조용히 넘어가지 않고 True(=검토 필요)로 안전하게 처리한다.

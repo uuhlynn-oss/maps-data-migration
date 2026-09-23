@@ -161,9 +161,17 @@ class MappingEngine:
 
     def _format_timestamp(self, d, name, stype, ctx):
         s = F.trim(F.col(d["SOURCE_COLUMN"]))
+        tz = F.lit(ctx["source_tz"])
         # 시간대를 문자열에 붙여 "명시적으로" 파싱한다 -> 세션 시간대와 무관하게 정확한 절대 시각(UTC 기준)이 저장된다.
         # (try_to_timestamp: 서버리스의 ANSI 모드에서도 형식 오류를 예외 대신 NULL로 돌려준다)
-        parsed = F.try_to_timestamp(F.concat_ws(" ", s, F.lit(ctx["source_tz"])), F.lit(f"{cfg.SOURCE_TIMESTAMP_FORMAT} VV"))
+        # DQ Cleansing(CLN-VAL-002)이 모든 소스를 표준 포맷으로 정규화해주므로 원천 포맷별 예외 처리는 필요 없다.
+        # 다만 날짜만 있는 값(DQ의 DATE_STANDARD_FORMAT "yyyy-MM-dd")은 DQ가 시각을 추정하지 않고 그대로 두므로,
+        # Target이 TIMESTAMP인 컬럼에서는 그 값을 자정(00:00:00)으로 채우는 구조적 변환만 여기서 한다.
+        attempts = [
+            F.try_to_timestamp(F.concat_ws(" ", s, tz), F.lit(f"{cfg.SOURCE_TIMESTAMP_FORMAT} VV")),
+            F.try_to_timestamp(F.concat_ws(" ", s, tz), F.lit("yyyy-MM-dd VV")),
+        ]
+        parsed = F.coalesce(*attempts).cast(stype)   # 세션의 timestamp/timestamp_ntz 설정과 무관하게 Target Model 타입으로 고정
         failed = s.isNotNull() & (s != "") & parsed.isNull()
         return parsed, failed, None
 
@@ -372,15 +380,30 @@ class MappingEngine:
     # 저장: gold_candidate.<target> 물리 테이블에 같은 소스·배치만 교체 (기본 흐름).
     # 서버리스는 전역 임시 뷰를 지원하지 않고 세션 간 데이터 전달에 물리 테이블/세션 임시 뷰를 권장하므로,
     # 노트북이 분리돼 있어도 이어지도록 처음부터 물리 테이블로 간다.
+    #
+    # _map_errors가 있는 행(값 변환 실패)은 gold_candidate에 넣지 않고 gold_mapping_error로 보낸다.
+    # Gold Validation은 gold_candidate만 입력으로 쓰므로, 이렇게 하면 Mapping 실패가 Gold Validation에서
+    # 다시 걸려 gold_quarantine으로 이중 격리되는 일이 생기지 않는다. (_unmapped_codes는 격리 대상이 아니라
+    # 그대로 gold_candidate에 남는다 - mapping_config.UNMAPPED_CODE_POLICY 참고)
     # ------------------------------------------------------------------
     def save(self, candidate: DataFrame, summary: Dict[str, Any]) -> str:
-        table = cfg.gold_candidate_table(summary["target_table"])
+        target_table = summary["target_table"]
+        table = cfg.gold_candidate_table(target_table)
+        error_table = cfg.gold_mapping_error_table(target_table)
         self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS {cfg.UC_CATALOG}.{cfg.GOLD_CANDIDATE_SCHEMA}")
-        if not self.spark.catalog.tableExists(table):
-            (candidate.limit(0).write.format("delta").mode("overwrite")
-             .partitionBy("_source_batch_id").saveAsTable(table))
-        # 여러 소스가 같은 후보 테이블을 공유하므로 (소스, 배치) 단위로만 교체한다
+        self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS {cfg.UC_CATALOG}.{cfg.GOLD_MAPPING_ERROR_SCHEMA}")
+
+        clean = candidate.filter(F.col("_map_errors").isNull())
+        errors = candidate.filter(F.col("_map_errors").isNotNull())
+
+        # 여러 소스가 같은 테이블을 공유하므로 (소스, 배치) 단위로만 교체한다 - 두 테이블 모두 같은 정책
         predicate = f"_source_system = '{summary['silver_source']}' AND _source_batch_id = '{summary['source_batch_id']}'"
-        (candidate.write.format("delta").mode("overwrite")
-         .option("replaceWhere", predicate).option("mergeSchema", "true").saveAsTable(table))
+        for df, tbl in ((clean, table), (errors, error_table)):
+            if not self.spark.catalog.tableExists(tbl):
+                (df.limit(0).write.format("delta").mode("overwrite")
+                 .partitionBy("_source_batch_id").saveAsTable(tbl))
+            (df.write.format("delta").mode("overwrite")
+             .option("replaceWhere", predicate).option("mergeSchema", "true").saveAsTable(tbl))
+
+        summary["mapping_error_rows_excluded"] = errors.count()
         return table

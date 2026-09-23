@@ -1,15 +1,22 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "5"
+# ///
 # MAGIC %md
-# MAGIC # Target Validation만 다시 실행 (재검증용)
+# MAGIC # Target Validation 실행: gold_candidate → Gold / gold_quarantine / MIGRATION_TRACE
 # MAGIC
-# MAGIC **보통은 `mapping_run_all.py` 하나로 Mapping + Validation이 한 번에 끝납니다.** 이 노트북은 매핑은 그대로 두고
-# MAGIC Validation만 다시 돌리고 싶을 때(예: `target_model`이나 규칙을 고친 뒤 재확인) 쓰는 보조 노트북입니다.
+# MAGIC `03_mapping_run.py`를 먼저 실행해 `gold_candidate.<target>` 물리 테이블을 만들어 두면, 이 노트북은
+# MAGIC **별도 세션/새 클러스터에서 나중에 실행해도 됩니다.** `gold_candidate`는 Mapping Engine이 저장한 물리 Delta
+# MAGIC 테이블이라(임시 뷰 아님) 세션이 끝나도 남아 있습니다. 이 테이블에는 `_map_errors`가 있던(값 변환 실패) 행은
+# MAGIC 애초에 들어오지 않으므로(별도 `<target>_mapping_error` 테이블로 분리 저장됨), 여기서 나오는 격리(`gold_quarantine`)는
+# MAGIC 오직 "Mapping은 끝났지만 TO-BE 품질/업무 규칙을 만족 못한" 경우만 의미합니다.
 # MAGIC
-# MAGIC `gold_candidate.<target>` **물리 테이블**(mapping_engine.save()가 저장한 것)을 읽습니다. 다른 노트북에서 저장한 것도 보입니다.
+# MAGIC **이 노트북이 하는 일**: 통합 후보 확인 → 검증 실행(15개 규칙 + CTI_ID 중복 보정) → 요약 → 위반 규칙 분포 → 저장(Gold/격리/MIGRATION_TRACE) → 결과 확인
 
 # COMMAND ----------
 
-TARGET_TABLE = "COUNSEL"
+TARGET_TABLE = "COMPLAINT"
 SAVE = True          # False면 저장 없이 결과만 확인
 
 # COMMAND ----------
@@ -36,8 +43,9 @@ def _show(df, n=10):
 
 # COMMAND ----------
 
-# MAGIC %md ## 1. 후보 확인
-# MAGIC `mapping_run.py` 또는 `mapping_run_all.py`가 저장한 물리 테이블입니다.
+# MAGIC %md ## 1. 통합 후보 확인
+# MAGIC `mapping_run.py`(또는 `mapping_run_all.py`)가 저장한 `gold_candidate.<target>` 물리 테이블입니다.
+# MAGIC 다른 세션/다른 노트북에서 저장한 것도 여기서 그대로 보입니다.
 
 # COMMAND ----------
 

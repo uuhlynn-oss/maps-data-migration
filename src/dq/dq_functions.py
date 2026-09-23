@@ -5,7 +5,7 @@ DQ 검사·정제 순수 함수 모음. Spark Column을 받아 Column을 돌려�
 실행(재-DQ 판정, 규칙 저장소, 결과 리포트, 전체 조립)은 dq_engine.py에 있다.
 """
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from pyspark.sql import Column, DataFrame, Window
 from pyspark.sql import functions as F
@@ -145,72 +145,47 @@ def row_error_expr(rule: Dict[str, Any], codes=None) -> Column:
     raise ValueError(f"지원하지 않는 Rule Type입니다: {t}")
 
 
-def check_null(df: DataFrame, rule: Dict[str, Any], record_key_col: str = None) -> Dict[str, Any]:
-    """NULL 값 검사 (DataFrame API 사용)"""
-    col_name = rule["column"]
+def _summarize_check(df: DataFrame, error_df: DataFrame, col_name: str,
+                     record_key_col: str, dq_reason: str) -> Dict[str, Any]:
+    """단일 컬럼 검사(NULL/PATTERN/RANGE/CODE_EXISTS)가 공통으로 쓰는 결과 형태를 만든다.
+    error_df는 각 check 함수가 자신의 오류 조건으로 이미 필터링해 넘긴다."""
     check_count = df.count()
-    
-    # 에러 조건: 값이 NULL이거나 빈 문자열인 경우
-    error_df = df.filter(null_error(F.col(col_name)))
     error_count = error_df.count()
-    
-    # RDD 대신 DataFrame의 limit 및 collect를 사용하여 샘플 추출
     sample_rows = error_df.limit(5).select(col_name).collect()
     sample_values = _masked_sample_values(sample_rows, col_name)  # 원문 대신 마스킹된 값 저장
-    
     return {
         "check_count": check_count,
         "error_count": error_count,
         "sample_values": sample_values,
-        "dq_reason": f"Column '{col_name}' contains NULL or empty values.",
+        "dq_reason": dq_reason,
         "detail_df": _build_detail_df(error_df, record_key_col, col_name, [col_name]),
         "error_df": error_df,
     }
+
+
+def check_null(df: DataFrame, rule: Dict[str, Any], record_key_col: str = None) -> Dict[str, Any]:
+    """NULL 값 검사"""
+    col_name = rule["column"]
+    error_df = df.filter(null_error(F.col(col_name)))
+    return _summarize_check(df, error_df, col_name, record_key_col,
+                            f"Column '{col_name}' contains NULL or empty values.")
+
 
 def check_pattern(df: DataFrame, rule: Dict[str, Any], record_key_col: str = None) -> Dict[str, Any]:
     """정규식 패턴 검사"""
-    col_name = rule["column"]
-    pattern = rule["pattern"]
-    check_count = df.count()
-    
-    # 패턴에 매칭되지 않거나 NULL인 경우 에러
+    col_name, pattern = rule["column"], rule["pattern"]
     error_df = df.filter(pattern_error(F.col(col_name), pattern))
-    error_count = error_df.count()
-    
-    sample_rows = error_df.limit(5).select(col_name).collect()
-    sample_values = _masked_sample_values(sample_rows, col_name)  # 원문 대신 마스킹된 값 저장
-    
-    return {
-        "check_count": check_count,
-        "error_count": error_count,
-        "sample_values": sample_values,
-        "dq_reason": f"Column '{col_name}' does not match pattern '{pattern}'.",
-        "detail_df": _build_detail_df(error_df, record_key_col, col_name, [col_name]),
-        # 자동 정제(2번 섹션의 CleansingEngine)가 마스킹 전 원문 값을 써야 해서 오류 행 원본도 함께 넘긴다 (lazy DataFrame이라 추가 비용 없음)
-        "error_df": error_df,
-    }
+    return _summarize_check(df, error_df, col_name, record_key_col,
+                            f"Column '{col_name}' does not match pattern '{pattern}'.")
+
 
 def check_range(df: DataFrame, rule: Dict[str, Any], record_key_col: str = None) -> Dict[str, Any]:
     """숫자 범위 검사"""
-    col_name = rule["column"]
-    min_val = rule["min_value"]
-    max_val = rule["max_value"]
-    check_count = df.count()
-    
+    col_name, min_val, max_val = rule["column"], rule["min_value"], rule["max_value"]
     error_df = df.filter(range_error(F.col(col_name), min_val, max_val))
-    error_count = error_df.count()
-    
-    sample_rows = error_df.limit(5).select(col_name).collect()
-    sample_values = _masked_sample_values(sample_rows, col_name)  # 원문 대신 마스킹된 값 저장
-    
-    return {
-        "check_count": check_count,
-        "error_count": error_count,
-        "sample_values": sample_values,
-        "dq_reason": f"Column '{col_name}' is out of range [{min_val}, {max_val}].",
-        "detail_df": _build_detail_df(error_df, record_key_col, col_name, [col_name]),
-        "error_df": error_df,
-    }
+    return _summarize_check(df, error_df, col_name, record_key_col,
+                            f"Column '{col_name}' is out of range [{min_val}, {max_val}].")
+
 
 def check_start_end_order(df: DataFrame, rule: Dict[str, Any], record_key_col: str = None) -> Dict[str, Any]:
     """시작/종료 시각 순서 검사 (주어진 컬럼 순서가 거꾸로 된 경우 에러)"""
@@ -239,28 +214,12 @@ def check_start_end_order(df: DataFrame, rule: Dict[str, Any], record_key_col: s
 def check_code_exists(df: DataFrame, rule: Dict[str, Any], code_master_df: DataFrame,
                        record_key_col: str = None) -> Dict[str, Any]:
     """코드 마스터 존재 여부 검사 (Anti-Join 활용)"""
-    col_name = rule["column"]
-    code_group = rule["code_group"]
-    check_count = df.count()
-    
-    # 해당 코드 그룹의 마스터 코드들 필터링
+    col_name, code_group = rule["column"], rule["code_group"]
     filtered_master = code_master_df.filter(F.col("CODE_GROUP") == code_group).select("CODE").distinct()
-    
     # 마스터에 존재하지 않는 값들을 에러로 판단 (Left Anti Join)
     error_df = df.join(filtered_master, df[col_name] == filtered_master["CODE"], "left_anti")
-    error_count = error_df.count()
-    
-    sample_rows = error_df.limit(5).select(col_name).collect()
-    sample_values = _masked_sample_values(sample_rows, col_name)  # 원문 대신 마스킹된 값 저장
-    
-    return {
-        "check_count": check_count,
-        "error_count": error_count,
-        "sample_values": sample_values,
-        "dq_reason": f"Value in '{col_name}' does not exist in CODE_MASTER (Group: {code_group}).",
-        "detail_df": _build_detail_df(error_df, record_key_col, col_name, [col_name]),
-        "error_df": error_df,
-    }
+    return _summarize_check(df, error_df, col_name, record_key_col,
+                            f"Value in '{col_name}' does not exist in CODE_MASTER (Group: {code_group}).")
 
 def check_duplicate(df: DataFrame, rule: Dict[str, Any], record_key_col: str = None) -> Dict[str, Any]:
     """중복 데이터 검사"""

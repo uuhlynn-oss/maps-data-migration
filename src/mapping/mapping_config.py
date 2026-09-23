@@ -5,6 +5,7 @@ Silver -> Gold Mapping Execution 설정 (슬라이스 1: 인바운드 -> COUNSEL
 UC_CATALOG = "maps_databricks"
 META_SCHEMA = "meta"
 GOLD_CANDIDATE_SCHEMA = "gold_candidate"
+GOLD_MAPPING_ERROR_SCHEMA = "gold_mapping_error"   # _map_errors IS NOT NULL 행 전용 (Gold Validation 입력에서 제외)
 SILVER_INPUT_SCHEMA = "silver_candidate"   # 정식 Silver 테이블이 생기면 여기만 바꾼다
 
 # ---- 엔진이 읽는 메타데이터 테이블 (mapping_seed_loader.py로 CSV에서 적재) ----
@@ -19,8 +20,14 @@ def silver_input_table(silver_source: str) -> str:
 
 
 def gold_candidate_table(target_table: str) -> str:
-    """Target 테이블 1개당 후보 테이블 1개. 여러 소스(inbound/outbound/...)가 같은 후보 테이블에 _source_system으로 구분되어 들어간다."""
+    """Target 테이블 1개당 후보 테이블 1개. 여러 소스(inbound/outbound/...)가 같은 후보 테이블에 _source_system으로 구분되어 들어간다.
+    _map_errors가 있는 행은 여기 들어가지 않는다 (gold_mapping_error_table 참고) - Gold Validation의 입력은 항상 Mapping 성공분뿐이다."""
     return f"{UC_CATALOG}.{GOLD_CANDIDATE_SCHEMA}.{target_table.lower()}"
+
+
+def gold_mapping_error_table(target_table: str) -> str:
+    """_map_errors IS NOT NULL인 행(값 변환 실패)만 모아두는 테이블. gold_candidate_table과 같은 naming 패턴."""
+    return f"{UC_CATALOG}.{GOLD_MAPPING_ERROR_SCHEMA}.{target_table.lower()}"
 
 
 # 소스 시스템 이름이 문서마다 달라서(매핑 정의 INBOUND / 코드 매핑표 인바운드 / Silver inbound) 한 곳에서 연결한다.
@@ -35,7 +42,11 @@ SOURCE_SYSTEMS = {
 # 이 엔진이 실행할 수 있는 Target 테이블 (소스 1행 -> Target 1행, 즉 1:1 변환만).
 # CUSTOMER / CONTRACT처럼 여러 소스 행이 같은 개체로 합쳐지는 테이블은 중복 제거와 개체 통합(고객 매칭, ID 생성)이 필요해서
 # 다음 단계에서 다룬다. 그때까지 실행하면 "상담 1건당 1행"이 나와 잘못된 결과가 되므로 막아 둔다.
-SUPPORTED_TARGET_TABLES = ("COUNSEL",)
+# COMPLAINT(HOMEPAGE)는 target_model/mapping_definition 확인 결과 NOT NULL 컬럼(CMPL_ID/CMPL_CNTNT/REG_DTM)이
+# 전부 이 엔진이 지원하는 매핑 타입(RENAME/COPY, TIMESTAMP FORMAT)으로 커버되어 1:1로 안전해 추가한다.
+# CUSTOMER(CUST_ID PK 매핑 자체가 없음)/CONTRACT(PK·FK가 DERIVED/GENERATE_ID·LOOKUP으로만 정의돼 엔진 미지원)/
+# COUNSEL_DETAIL(PK 매핑 없음 + EXPLODE로 실제 1:N)/PRODUCT(mapping_definition 행 자체가 없음)는 계속 제외한다.
+SUPPORTED_TARGET_TABLES = ("COUNSEL", "COMPLAINT")
 
 # 실행 대상 매핑 행 조건: FINAL_MIGRATION_APPLY_YN = 'Y' 이고 REVIEW_STATUS가 아래 중 하나
 APPLY_REVIEW_STATUSES = ("APPROVED", "MODIFIED_APPROVED")
@@ -51,7 +62,7 @@ DEFAULT_SOURCE_TIMEZONE = "Asia/Seoul"
 SOURCE_TIMEZONE = {
     "INBOUND": "Asia/Seoul",
 }
-SOURCE_TIMESTAMP_FORMAT = "yyyy-MM-dd HH:mm:ss"
+SOURCE_TIMESTAMP_FORMAT = "yyyy-MM-dd HH:mm:ss"   # 표준 포맷 - DQ Cleansing(CLN-VAL-002)이 모든 소스를 이 형식으로 정규화한다.
 
 # ---- 정책 (잠정) ----
 # 승인된 코드 매핑이 없는 값(REVIEW 포함)은 격리하지 않고 NULL로 적재하고, 원천 값을 _unmapped_codes에 남긴다.

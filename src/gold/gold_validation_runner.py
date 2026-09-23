@@ -1,9 +1,10 @@
 """
 Gold Target Validation 러너.
 
-    gold_candidate_<target> (임시 뷰, Mapping Engine 결과)
+    gold_candidate.<target> (물리 Delta 테이블, Mapping Engine의 save()가 저장 - _map_errors가 있던 행은
+    애초에 여기 없다. mapping_run.py와 이 노트북이 같은 세션일 필요가 없다)
         │
-        ├─ 1) meta.target_model에서 검사 규칙을 매번 다시 만든다 (SCHEMA/NOT_NULL/UNIQUE/LENGTH/TYPE/DOMAIN)
+        ├─ 1) meta.target_model에서 검사 규칙을 매번 다시 만든다 (SCHEMA/NOT_NULL/UNIQUE/LENGTH/DOMAIN)
         │     + gold_validation_config.BUSINESS_RULES (컬럼 간 업무 규칙)
         ▼
     검사 (레코드별로 위반 규칙 목록을 만든다)
@@ -76,11 +77,10 @@ def derive_rules(target_model_df: DataFrame, target_table: str) -> Tuple[List[Di
             n = int(m.group(2))
             rules.append({"rule_id": f"VR-{target_table}-{seq:03d}-LENGTH", "type": "LENGTH", "columns": [col],
                           "check": lambda c=col, n=n: F.length(F.col(c)) > F.lit(n)})
-        if _spark_type(dtype) in ("timestamp", "date"):
-            # Mapping Engine이 남긴 _map_errors(콤마 구분 컬럼 목록)에 이 컬럼이 있으면 변환 실패
-            rules.append({"rule_id": f"VR-{target_table}-{seq:03d}-TYPE", "type": "TYPE", "columns": [col],
-                          "check": lambda c=col: F.col("_map_errors").isNotNull()
-                          & F.array_contains(F.split(F.col("_map_errors"), ","), c)})
+        # TYPE(_map_errors 재검사) 규칙은 없앴다: Mapping Engine이 _map_errors가 있는 행을 gold_candidate에
+        # 넣지 않고 mapping_error 테이블로 따로 보내므로(mapping_engine.save() 참고), 여기서 다시 검사하면
+        # 항상 위반 없음(dead code)일 뿐 아니라 이중 격리 구조를 다시 만들게 된다. Gold Validation의 실패는
+        # 오직 "Mapping은 끝났지만 TO-BE 품질/업무 규칙을 만족 못한 경우"로 한정한다.
         enum = re.fullmatch(r"([A-Z]+(?:/[A-Z]+)+)", desc.strip())
         if enum:
             vals = enum.group(1).split("/")
