@@ -22,8 +22,8 @@
 # COMMAND ----------
 
 # 파라미터 (여기만 바꿔서 실행)
-SOURCE_SYSTEM = "OUTBOUND"     # 매핑 정의의 SOURCE_SYSTEM (TARGET_TABLE="CUSTOMER"일 때는 무시되고 자동 조회됨)
-TARGET_TABLE = "CUSTOMER"      # 현재 지원 목록은 mapping_config.SUPPORTED_TARGET_TABLES 참고 (소스 1행 = Target 1행인 테이블만)
+SOURCE_SYSTEM = "INBOUND"     # 매핑 정의의 SOURCE_SYSTEM (TARGET_TABLE="CUSTOMER"일 때는 무시되고 자동 조회됨)
+TARGET_TABLE = "CONTRACT"      # 현재 지원 목록은 mapping_config.SUPPORTED_TARGET_TABLES 참고 (소스 1행 = Target 1행인 테이블만)
 SOURCE_BATCH_ID = None        # None이면 silver_candidate의 최신 배치 (CUSTOMER는 Source마다 각자의 최신 배치를 씀)
 SAVE_CANDIDATE = True         # gold_candidate.<target>에 저장 (후보를 뷰로 할지 물리 테이블로 할지 정하기 전의 확인용)
 PROJECT_ROOT = None           # 예: "/Workspace/Users/<계정>/maps"  (src/mapping이 이 폴더 아래에 있을 때. 이미 import되면 None 그대로)
@@ -197,8 +197,10 @@ else:
 
 # COMMAND ----------
 
-# MAGIC %md ## 6. 저장
-# MAGIC `gold_candidate.<target>`에 같은 소스·배치만 교체해서 저장합니다. (CUSTOMER는 아래 자동 실행 섹션에서 저장합니다)
+# MAGIC %md ## 6. 저장 + Entity Integration
+# MAGIC `gold_candidate.<target>`에 같은 소스·배치만 교체해서 저장한 뒤, `engine.integrate(TARGET_TABLE)`을
+# MAGIC 호출합니다. MERGE Target(CONTRACT 등)은 여기서 ID 채번+통합까지 끝나고, DIRECT/UNION Target은
+# MAGIC 자동으로 no-op입니다. (CUSTOMER는 아래 자동 실행 섹션에서 소스별로 저장 후 Integration까지 처리)
 
 # COMMAND ----------
 
@@ -210,6 +212,14 @@ elif SAVE_CANDIDATE:
          .filter((F.col("_source_system") == summary["silver_source"]) & (F.col("_source_batch_id") == summary["source_batch_id"]))
          .count())
     print(f"✅ {table} 저장 완료: 이번 소스·배치 {n}행")
+
+    # Entity Integration (MERGE Target만 실제로 동작). CUSTOMER처럼 entity_integration_definition에
+    # TARGET_ENTITY 행이 있고 INTEGRATION_TYPE=MERGE인 Target(예: CONTRACT)은 이 한 번의 호출로 PK
+    # 채번(target_model의 KEY='PK' 컬럼을 동적으로 찾음 - CNTR_ID 하드코딩 없음)까지 끝난다. 정의가 없거나
+    # DIRECT/UNION인 Target(COUNSEL, COMPLAINT)은 engine.integrate()가 내부에서 이미 no-op으로 처리하므로
+    # (mapping_engine.py L657-659), TARGET_TABLE로 분기하지 않고 항상 호출해도 기존 결과에 영향이 없다.
+    integration_result = engine.integrate(TARGET_TABLE)
+    print(f"\n[Entity Integration] {integration_result}")
 else:
     print("SAVE_CANDIDATE=False: 저장하지 않았습니다.")
 
@@ -259,4 +269,31 @@ else:
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC select * from maps_databricks.gold_mapping_error.customer;
+# MAGIC select * from maps_databricks.gold_candidate.contract limit 10
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT COUNT(*) AS cnt
+# MAGIC FROM maps_databricks.gold_candidate.customer;
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT *
+# MAGIC FROM maps_databricks.meta.entity_integration_definition
+# MAGIC WHERE TARGET_ENTITY IN ('CUSTOMER', 'CONTRACT');
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT
+# MAGIC     APRV_YN,
+# MAGIC     COUNT(*) AS cnt
+# MAGIC FROM maps_databricks.gold_candidate.product_mapping
+# MAGIC GROUP BY APRV_YN;
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC select * from maps_databricks.gold_candidate.product limit 10

@@ -6,6 +6,12 @@
 # MAGIC %md
 # MAGIC # Target Validation 실행: gold_candidate → Gold / gold_quarantine / MIGRATION_TRACE
 # MAGIC
+# MAGIC ⚠️ **운영 순서 주의(Relationship Validation)**: TARGET_TABLE이 target_model DESCRIPTION에 `→ TABLE.COLUMN`
+# MAGIC 형태로 다른 테이블을 FK 참조한다면, 참조 대상 테이블을 **먼저** 이 노트북으로 실행해 `gold.<참조테이블>`을
+# MAGIC 채워둬야 FK가 실제로 검증됩니다. 참조 테이블이 아직 없으면 FAIL이 아니라 SKIP되며(§3에서 확인),
+# MAGIC `summary["relationship_rules_skipped"]`에 어떤 FK가 검증되지 않았는지 남습니다 — 비어 있지 않으면 PASS를
+# MAGIC 전부 신뢰하지 말고 참조 테이블을 먼저 실행한 뒤 재실행하세요.
+# MAGIC
 # MAGIC `03_mapping_run.py`를 먼저 실행해 `gold_candidate.<target>` 물리 테이블을 만들어 두면, 이 노트북은
 # MAGIC **별도 세션/새 클러스터에서 나중에 실행해도 됩니다.** `gold_candidate`는 Mapping Engine이 저장한 물리 Delta
 # MAGIC 테이블이라(임시 뷰 아님) 세션이 끝나도 남아 있습니다. 이 테이블에는 `_map_errors`가 있던(값 변환 실패) 행은
@@ -16,7 +22,7 @@
 
 # COMMAND ----------
 
-TARGET_TABLE = "CUSTOMER"
+TARGET_TABLE = "CONTRACT"
 SAVE = True          # False면 저장 없이 결과만 확인
 
 # COMMAND ----------
@@ -111,3 +117,26 @@ if SAVE:
     print(f"\n{tables['gold_table']}: 이번 실행 적재분 {summary['loaded_count']}행 (테이블 전체 {gold_n.count()}행, 재실행 시 누적 - 알려진 제약)")
 else:
     print("SAVE=False: 저장하지 않았습니다.")
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT
+# MAGIC     c._source_record_key,
+# MAGIC     c.PRD_ID,
+# MAGIC     s.product_code
+# MAGIC FROM maps_databricks.gold_candidate.contract c
+# MAGIC LEFT JOIN maps_databricks.silver_candidate.inbound s
+# MAGIC     ON c._source_record_key = s._source_record_key
+# MAGIC WHERE c._source_record_key IN (
+# MAGIC     'CS202606020105',
+# MAGIC     'CS202606020294',
+# MAGIC     'CS202606020721',
+# MAGIC     'CS202606030048',
+# MAGIC     'CS202606030674',
+# MAGIC     'CS202606080293',
+# MAGIC     'CS202606090569',
+# MAGIC     'CS202606160101',
+# MAGIC     'CS202606160550',
+# MAGIC     'CS202606180050'
+# MAGIC );

@@ -12,10 +12,45 @@ Silver -> Gold Mapping Execution 엔진.
     (TRANSFORM, FORMAT)       TIMESTAMP: 원천 시간대의 시각 문자열 -> UTC 시각 (TO-BE 물리 정책)
     (CODE, LOOKUP)            승인된 AS-IS -> TO-BE 코드 변환. 매핑이 없으면 NULL + _unmapped_codes 기록
     (DERIVED, CONSTANT)       고정값 (코드 매핑표의 (SOURCE_SYSTEM) 행)
-    그 밖(CUSTOMER_MATCH, PRODUCT_MAPPING 조회, GENERATE_ID, EXPLODE ...)은 이번 단계에서 NULL로 두고
+    (DERIVED, LOOKUP)         FK: 다른 Target의 gold_candidate에서 PK 값 조회 (run()이 미리 join, 아래
+                              "FK Lookup" 참고). CODE_MAPPING_RULE == "PRODUCT_MAPPING"인 행은 예외로,
+                              PRODUCT를 직접 조회하지 않고 PRODUCT_MAPPING 크로스워크(SRC_SYS+SRC_PRD_CD,
+                              APRV_YN='Y')를 거친다. 참조 Target/크로스워크를 못 찾거나 아직 실행 전이면
+                              (그리고 물론 값 자체가 안 맞으면) NULL + _unmapped_codes 기록
+    그 밖(CUSTOMER_MATCH, GENERATE_ID, EXPLODE ...)은 이번 단계에서 NULL로 두고
     summary["deferred_columns"]에 사유와 함께 기록한다. (정의가 잘못된 경우와 달리 실행을 막지 않는다)
 
 정의(Mapping Definition, Target Model, 코드 매핑)가 잘못된 경우에는 일부만 변환해서 내보내지 않고 ValueError로 즉시 멈춘다.
+
+FK Lookup (DERIVED, LOOKUP)
+    run()이 메인 컬럼 루프 전에, 이 조합의 컬럼마다 참조 Target을 target_model에서 동적으로 찾아
+    (_fk_reference_table - "이 FK 컬럼과 같은 이름의 PK를 가진 테이블") 그 gold_candidate와 미리 join한다.
+    매칭 방식은 참조 Target에 자연키(KEY='UK')가 있는지로 갈린다:
+        자연키 있음(예: PRODUCT.PRD_CD)   Silver 원천 값과 완전일치로 매칭
+        자연키 없음(예: CUSTOMER)         gold_entity_lineage.<참조Target> crosswalk(있으면 우선)로 원본
+                                         레코드(lineage: _source_system/_source_batch_id/_source_record_key)를
+                                         최종 PK와 잇는다 - Entity Integration(MERGE)이 대표 행 하나로 축약해도
+                                         crosswalk는 병합 전 전체 원본의 lineage를 보존해 두므로(integrate()가
+                                         저장) 대표로 안 뽑힌 원본도 찾을 수 있다. crosswalk가 아직 없으면(과거
+                                         integrate() 실행분) 참조 Target의 gold_candidate에서 lineage로 직접
+                                         조회하는 기존 방식으로 폴백한다(이 경우 병합 중 사라진 쪽은 NULL)
+    예외: mapping_definition.CODE_MAPPING_RULE == "PRODUCT_MAPPING"인 행(현재 CONTRACT/COUNSEL/COMPLAINT의
+    PRD_ID)은 위 규칙을 타지 않는다. 채널별 상품코드(product_code/GD_CD 등)는 표준 PRD_CD와 체계가 달라
+    PRODUCT를 직접 조회할 수 없기 때문 - 대신 PRODUCT_MAPPING(target_model에 이미 정의된 크로스워크:
+    SRC_SYS/SRC_PRD_CD -> TGT_PRD_ID, APRV_YN)을 SRC_SYS=이 행의 SOURCE_SYSTEM, SRC_PRD_CD=Silver의
+    SOURCE_COLUMN 값, APRV_YN='Y' 조건으로 조회해 TGT_PRD_ID를 그대로 가져온다(이미 최종 PK 값이라
+    PRODUCT를 다시 조회할 필요 없음, 1-hop). PRODUCT_MAPPING_TABLE이 아직 없거나 매칭이 없으면 다른
+    FK Lookup과 동일하게 NULL + _unmapped_codes.
+    참조 Target/크로스워크를 못 찾거나 아직 실행 전이면 그 컬럼은 기존과 동일하게 deferred로 남는다(에러 아님).
+
+run() 이후 gold_candidate 반영 방식 (Target 유형별) - mapping_config.SUPPORTED_TARGET_TABLES의 A/B/C 참고
+    A. Direct Mapping           save()만으로 끝난다. (COUNSEL, COMPLAINT)
+    B. Entity Integration        여러 소스의 run()/save() 후 integrate()가 Record Matching + 중복 제거/통합
+                                 (MERGE) + ID 생성/재사용을 한 번에 한다. (CUSTOMER, CONTRACT)
+    C. Master Data Integration    비즈니스가 이미 확정한 Master Data 기준이라 매칭/병합이 필요 없다.
+                                 load_master_data()가 run() 결과를 받아 자연키 기준 ID 재사용/신규 발급과
+                                 "현재 전체 스냅샷"으로의 저장을 한 번에 한다. (PRODUCT)
+    B/C 모두 PK 채번의 실제 알고리즘(포맷·순번 부여)은 _assign_sequential_ids를 공유한다.
 """
 import hashlib
 import uuid
@@ -97,6 +132,30 @@ class MappingEngine:
         if not rows:
             raise ValueError(f"TO-BE 모델에 Target 테이블 '{target_table}'이(가) 없습니다.")
         return rows
+
+    def _fk_reference_table(self, fk_column: str) -> Optional[str]:
+        """fk_column과 이름이 같은 PK(KEY='PK')를 가진 target_model의 TABLE_NAME을 찾는다 - FK Lookup이
+        참조할 Target을 "CUST_ID -> CUSTOMER"처럼 하드코딩하지 않고 target_model에서 동적으로 찾기 위한
+        장치다. target_model에 KEY 컬럼이 없거나(과거 테스트용 인라인 스키마 등), 못 찾거나, 같은 이름의
+        PK가 여럿이면(정의 모순) None을 돌려준다 - 이 경우 그 FK는 run()에서 deferred로 남는다."""
+        if "KEY" not in self._target_model.columns:
+            return None
+        rows = (self._target_model
+               .filter(F.upper(F.trim(F.col("COLUMN_NAME"))) == fk_column.upper())
+               .filter(F.upper(F.trim(F.col("KEY"))) == "PK")
+               .select(F.trim(F.col("TABLE_NAME")).alias("t")).distinct().collect())
+        return rows[0]["t"] if len(rows) == 1 else None
+
+    def _target_uk_column(self, table_name: str) -> Optional[str]:
+        """table_name의 target_model에서 자연키(KEY='UK')로 표시된 컬럼 1개를 찾는다 (예: PRODUCT.PRD_CD).
+        없거나(예: CUSTOMER - NAME+DOB로만 통합되어 별도 업무키를 안 남김) 여럿이면 None."""
+        if "KEY" not in self._target_model.columns:
+            return None
+        rows = (self._target_model
+               .filter(F.upper(F.trim(F.col("TABLE_NAME"))) == table_name.upper())
+               .filter(F.upper(F.trim(F.col("KEY"))) == "UK")
+               .select(F.trim(F.col("COLUMN_NAME")).alias("c")).distinct().collect())
+        return rows[0]["c"] if len(rows) == 1 else None
 
     def _load_definitions(self, source_system: str, target_table: str) -> List[Dict[str, Any]]:
         # mapping_seed_loader.py가 적재 시 MAPPING_ID 중복을 이미 거부하므로, 여기서는 버전 선택 없이 그대로 모은다.
@@ -211,7 +270,20 @@ class MappingEngine:
                              f"정확히 1개 찾아야 하는데 {len(rows)}개임")
         return F.lit(rows[0]["t"]).cast(stype), None, None
 
-    def _dispatch(self, d, stype) -> Optional[Callable]:
+    def _fk_lookup(self, d, name, stype, ctx):
+        """DERIVED/LOOKUP: 다른 Target의 gold_candidate에서 이 FK(PK) 값을 조회한다. 실제 조회는 run()이
+        메인 루프 전에 미리 join해 둔 임시 컬럼(ctx["fk_lookup_columns"][name])을 참조만 한다 - 이 핸들러는
+        (다른 핸들러와 같은 모양을 맞추려고) silver_df 자체 컬럼만으로 계산되는 Column 표현식이어야 하는데
+        JOIN은 표현할 수 없기 때문이다. 매칭 실패(참조 Target에 없음)는 코드 LOOKUP과 동일하게 NULL +
+        _unmapped_codes에 기록한다(제거하지 않음) - 근거 없는 값을 만들지 않는다는 정책과 같다."""
+        tmp_col = (ctx.get("fk_lookup_columns") or {}).get(name)
+        src = F.col(d["SOURCE_COLUMN"]).cast("string")
+        val = F.col(tmp_col).cast(stype)
+        unmapped = F.when(src.isNotNull() & (F.trim(src) != "") & val.isNull(),
+                          F.concat(F.lit(f"{name}="), src))
+        return val, None, unmapped
+
+    def _dispatch(self, d, stype, ctx=None) -> Optional[Callable]:
         key = (str(d["MAPPING_TYPE"]).upper(), str(d["PROCESS_TYPE"]).upper())
         # Target이 timestamp면 선언된 MAPPING_TYPE(TRANSFORM/FORMAT 뿐 아니라 DIRECT/COPY, RENAME/COPY도)과 무관하게
         # 항상 시간대를 명시해 파싱한다. _copy가 먼저 걸리면 F.col(...).cast("timestamp")로 세션 시간대에 의존하게 되어
@@ -232,6 +304,12 @@ class MappingEngine:
             return self._code_lookup
         if key == ("DERIVED", "CONSTANT"):
             return self._constant
+        # DERIVED/LOOKUP(다른 Target의 gold_candidate 참조)은 run()이 미리 join을 성공시킨 컬럼에 대해서만
+        # 처리한다(ctx["fk_lookup_columns"]에 있는 경우만) - 참조 Target을 못 찾았거나 아직 실행 전이면
+        # 기존과 동일하게 여기서 None을 돌려줘 deferred로 남긴다(_reference_timestamp처럼 ctx에
+        # fk_lookup_columns가 없는 호출도 안전하게 여기로 떨어진다).
+        if key == ("DERIVED", "LOOKUP") and d["TARGET_COLUMN"] in ((ctx or {}).get("fk_lookup_columns") or {}):
+            return self._fk_lookup
         return None
 
     # ------------------------------------------------------------------
@@ -310,6 +388,78 @@ class MappingEngine:
             "code_mapping_system": ss["code_mapping"],
             "source_tz": cfg.SOURCE_TIMEZONE.get(source_system, cfg.DEFAULT_SOURCE_TIMEZONE),
         }
+
+        # ---- FK Lookup(DERIVED/LOOKUP) 사전 조인 ----
+        # 핸들러는 silver_df 자체 컬럼만으로 계산되는 Column 표현식이라 JOIN을 표현할 수 없다 - 그래서 이
+        # 컬럼들만 미리 참조 Target의 gold_candidate와 join해 silver_df에 임시 컬럼(_fk_lookup_<컬럼명>)으로
+        # 얹어 두고, 메인 루프의 _fk_lookup 핸들러는 그 임시 컬럼을 참조만 한다. 참조 Target은 하드코딩하지
+        # 않고 target_model에서 "이 FK 컬럼과 같은 이름의 PK를 가진 테이블"로 동적으로 찾는다
+        # (_fk_reference_table) - 예: CONTRACT.CUST_ID -> PK가 CUST_ID인 CUSTOMER.
+        # 단, CODE_MAPPING_RULE == "PRODUCT_MAPPING"인 행은 이 규칙을 타지 않는다 - 채널별 상품코드는 표준
+        # PRD_CD와 체계가 달라(예: LONG-ACC-001 vs AUTO-001) PRODUCT를 직접 조회할 수 없고, PRODUCT_MAPPING
+        # 크로스워크(SRC_SYS+SRC_PRD_CD -> TGT_PRD_ID, APRV_YN='Y' 승인분만)를 거쳐야 한다 - target_model의
+        # PRD_ID -> PRODUCT 직접 참조 규칙은 그대로 두고, mapping_definition에 이 표시가 있는 행만 예외로
+        # 먼저 처리한다(기존 컬럼 CODE_MAPPING_RULE 재사용 - 이전까지 전 행에서 빈 값이었다).
+        fk_lookup_columns: Dict[str, str] = {}
+        for d in defs:
+            key = (str(d["MAPPING_TYPE"]).upper(), str(d["PROCESS_TYPE"]).upper())
+            if key != ("DERIVED", "LOOKUP"):
+                continue
+            fk_col = d["TARGET_COLUMN"]
+            tmp_col = f"_fk_lookup_{fk_col}"
+
+            code_mapping_rule = str(d.get("CODE_MAPPING_RULE") or "").strip().upper()
+            if code_mapping_rule == "PRODUCT_MAPPING":
+                if not self.spark.catalog.tableExists(cfg.PRODUCT_MAPPING_TABLE):
+                    continue   # PRODUCT_MAPPING이 아직 없음 - deferred로 남긴다 (기존 정책과 동일)
+                pm_df = self.spark.table(cfg.PRODUCT_MAPPING_TABLE)
+                # TGT_PRD_ID가 이미 최종 PK 값이라 PRODUCT를 다시 조회할 필요가 없다(1-hop). SRC_SYS로
+                # 스코프를 좁히는 이유는 같은 코드 문자열이 소스 시스템마다 다른 상품을 가리킬 수 있어서다.
+                lookup = (pm_df
+                         .filter(F.upper(F.trim(F.col("SRC_SYS"))) == source_system)
+                         .filter(F.upper(F.trim(F.col("APRV_YN"))) == "Y")
+                         .select(F.trim(F.col("SRC_PRD_CD")).alias("_src_cd"), F.col("TGT_PRD_ID").alias(tmp_col))
+                         .dropDuplicates(["_src_cd"]))
+                silver_df = (silver_df
+                            .join(lookup, on=F.trim(F.col(d["SOURCE_COLUMN"])) == F.col("_src_cd"), how="left")
+                            .drop("_src_cd"))
+                fk_lookup_columns[fk_col] = tmp_col
+                continue
+
+            ref_table = self._fk_reference_table(fk_col)
+            if ref_table is None:
+                continue   # 참조 Target을 target_model에서 못 찾음 - 기존처럼 deferred로 남긴다
+            ref_gold = cfg.gold_candidate_table(ref_table)
+            if not self.spark.catalog.tableExists(ref_gold):
+                continue   # 참조 Target을 아직 실행 안 함 - deferred로 남긴다
+            ref_df = self.spark.table(ref_gold)
+            uk_col = self._target_uk_column(ref_table)
+            if uk_col:
+                # 참조 Target에 자연키(UK)가 있으면(예: PRODUCT.PRD_CD) Silver 값과 완전일치로 매칭한다.
+                lookup = (ref_df.select(F.trim(F.col(uk_col)).alias("_uk"), F.col(fk_col).alias(tmp_col))
+                         .dropDuplicates(["_uk"]))
+                silver_df = (silver_df
+                            .join(lookup, on=F.trim(F.col(d["SOURCE_COLUMN"])) == F.col("_uk"), how="left")
+                            .drop("_uk"))
+            else:
+                # 참조 Target에 자연키가 없으면(예: CUSTOMER - NAME+DOB 완전일치로만 통합되고 별도 업무키를
+                # 남기지 않음) Entity Lineage Crosswalk(gold_entity_lineage.<ref_table>)를 우선 쓴다 - MERGE 중
+                # 대표 행으로 축약되며 사라진 원본의 lineage도 여기서는 최종 PK와 이어져 있어 찾을 수 있다.
+                # crosswalk가 아직 없으면(과거 integrate() 실행분, 이 기능 도입 전) 기존처럼 참조 Target의
+                # gold_candidate에서 lineage로 직접 조회한다(대표 행만 남아있어 병합 중 사라진 쪽은 여전히 NULL).
+                lineage_keys = ["_source_system", "_source_batch_id", "_source_record_key"]
+                crosswalk_table = cfg.gold_entity_lineage_table(ref_table)
+                if self.spark.catalog.tableExists(crosswalk_table):
+                    lookup = (self.spark.table(crosswalk_table)
+                             .filter(F.col("TARGET_ENTITY") == ref_table)
+                             .select(*lineage_keys, F.col("TARGET_PK").alias(tmp_col))
+                             .dropDuplicates(lineage_keys))
+                else:
+                    lookup = ref_df.select(*lineage_keys, F.col(fk_col).alias(tmp_col)).dropDuplicates(lineage_keys)
+                silver_df = silver_df.join(lookup, on=lineage_keys, how="left")
+            fk_lookup_columns[fk_col] = tmp_col
+        ctx["fk_lookup_columns"] = fk_lookup_columns
+
         by_target = {d["TARGET_COLUMN"]: d for d in defs}
 
         value_cols: List[Column] = []
@@ -325,7 +475,7 @@ class MappingEngine:
                 value_cols.append(F.lit(None).cast(stype).alias(name))
                 deferred.append((name, "매핑 행 없음"))
                 continue
-            handler = self._dispatch(d, stype)
+            handler = self._dispatch(d, stype, ctx)
             if handler is None:
                 value_cols.append(F.lit(None).cast(stype).alias(name))
                 deferred.append((name, f"이번 단계 미지원 ({d['MAPPING_TYPE']}/{d['PROCESS_TYPE']})"))
@@ -467,29 +617,45 @@ class MappingEngine:
             out = part if out is None else out.unionByName(part)
         return out
 
-    def _assign_customer_ids(self, df: DataFrame) -> DataFrame:
-        """CUST_ID가 없는(=한 번도 배정 안 된 신규) 행에만 'CUST-000001' 형식으로 순번을 채운다 (PoC 수준).
-        전체에 row_number()를 다시 매기지 않고, 기존 CUST_ID 중 최대 번호 다음부터 신규 행에만 이어서 부여한다
-        - 이미 배정된 값이 있는 행은 이 함수에 오기 전에(fill_cols의 first(ignorenulls=True)) 이미 보존되어
-        CUST_ID가 채워진 채로 들어오므로 여기서는 손대지 않는다."""
-        if "CUST_ID" not in df.columns:
+    def _assign_sequential_ids(self, df: DataFrame, id_column: str, prefix: str,
+                                order_cols: List[str]) -> DataFrame:
+        """<id_column>이 없는(=한 번도 배정 안 된 신규) 행에만 '<PREFIX>-000001' 형식으로 순번을 채운다 (PoC 수준).
+        전체에 row_number()를 다시 매기지 않고, 기존 <id_column> 중 최대 번호 다음부터 신규 행에만 이어서
+        부여한다 - 이미 배정된 값이 있는 행은 이 함수에 오기 전에 이미 채워진 채로 들어온다고 가정하고
+        여기서는 손대지 않는다 (어떻게 채워 넣을지는 호출자 책임 - CUSTOMER는 integrate()의 fill_cols가,
+        PRODUCT는 assign_generated_id()의 자연키 backfill이 담당).
+
+        CUSTOMER(_assign_customer_ids)와 PRODUCT(assign_generated_id)가 공유하는 채번 핵심 로직이다.
+        기존 CUST_ID 채번 동작(포맷 'CUST-%06d', 정렬 기준)은 그대로다 - 이 함수는 그 로직을 prefix/정렬
+        기준만 바꿀 수 있게 일반화했을 뿐 계산 자체는 바뀌지 않았다."""
+        if id_column not in df.columns:
             return df
-        existing_n = (df.filter(F.col("CUST_ID").isNotNull())
-                     .select(F.regexp_extract(F.col("CUST_ID"), r"^CUST-(\d+)$", 1).cast("int").alias("n"))
+        existing_n = (df.filter(F.col(id_column).isNotNull())
+                     .select(F.regexp_extract(F.col(id_column), rf"^{prefix}-(\d+)$", 1).cast("int").alias("n"))
                      .agg(F.max("n")).collect()[0][0]) or 0
 
-        with_id = df.filter(F.col("CUST_ID").isNotNull())
-        without_id = df.filter(F.col("CUST_ID").isNull())
+        with_id = df.filter(F.col(id_column).isNotNull())
+        without_id = df.filter(F.col(id_column).isNull())
         if without_id.limit(1).count() == 0:
             return with_id
 
-        # 배치·레코드키 순으로 정렬해 채번 순서를 결정적으로 만든다 (재실행해도 같은 입력이면 같은 순서).
-        w = Window.orderBy("_source_batch_id", "_source_record_key")
+        # order_cols 순으로 정렬해 채번 순서를 결정적으로 만든다 (재실행해도 같은 입력이면 같은 순서).
+        w = Window.orderBy(*order_cols)
         new_ids = (without_id
                   .withColumn("_seq", F.row_number().over(w) + F.lit(existing_n))
-                  .withColumn("CUST_ID", F.format_string("CUST-%06d", F.col("_seq")))
+                  .withColumn(id_column, F.format_string(f"{prefix}-%06d", F.col("_seq")))
                   .drop("_seq"))
         return with_id.unionByName(new_ids)
+
+    def _assign_customer_ids(self, df: DataFrame) -> DataFrame:
+        """CUST_ID 채번. 기존 동작(포맷 'CUST-000001', 배치·레코드키 순 정렬) 그대로이며, 실제 계산은
+        _assign_sequential_ids로 일반화해 PRODUCT의 load_master_data()와 공유한다. integrate()는 이제 이
+        메서드를 직접 부르지 않고 target_model의 KEY='PK' 행에서 PK 컬럼/prefix를 동적으로 찾아 같은
+        _assign_sequential_ids를 호출한다(CUSTOMER든 CONTRACT든 동일 경로) - CUSTOMER에 대해서는 결과가
+        이 메서드를 호출한 것과 완전히 같다. 이 메서드는 외부에서 CUST_ID 채번만 필요할 때 쓰는 편의
+        함수로 남겨둔다."""
+        return self._assign_sequential_ids(df, "CUST_ID", "CUST",
+                                            order_cols=["_source_batch_id", "_source_record_key"])
 
     def integrate(self, target_table: str) -> Dict[str, Any]:
         target_table = target_table.upper()
@@ -504,8 +670,8 @@ class MappingEngine:
             raise ValueError(f"지원하지 않는 INTEGRATION_TYPE입니다: {integration_type}")
 
         matching_rule = spec.get("MATCHING_RULE")
-        if matching_rule != "NAME_DOB_PHONE_EXACT":
-            raise ValueError(f"지원하지 않는 MATCHING_RULE입니다: {matching_rule} (현재 NAME_DOB_PHONE_EXACT만 구현됨)")
+        if matching_rule not in cfg.SUPPORTED_MATCHING_RULES:
+            raise ValueError(f"지원하지 않는 MATCHING_RULE입니다: {matching_rule} (현재 {cfg.SUPPORTED_MATCHING_RULES}만 구현됨)")
         conflict_rule = spec.get("CONFLICT_RULE")
         if conflict_rule != "LATEST_NON_NULL":
             raise ValueError(f"지원하지 않는 CONFLICT_RULE입니다: {conflict_rule} (현재 LATEST_NON_NULL만 구현됨)")
@@ -602,11 +768,33 @@ class MappingEngine:
 
         merged = singles.unionByName(collapsed)
 
-        # CUST_ID 채번 (PoC 수준 - MAX+1, row_number 전체 재부여 아님). fill_cols 루프가 CUST_ID도 이미
+        # PK 채번 (PoC 수준 - MAX+1, row_number 전체 재부여 아님). fill_cols 루프가 PK 컬럼도 이미
         # first(ignorenulls=True)로 처리해서 "기존에 배정된 값 보존"은 여기 오기 전에 끝나 있다 - 여기서는
         # 그래도 NULL로 남은(=한 번도 배정 안 된 진짜 신규) 행에만 새 번호를 채운다.
-        merged = self._assign_customer_ids(merged)
+        # PK 컬럼/prefix는 target_model의 KEY='PK' 행에서 동적으로 찾는다 - CUSTOMER 전용으로 CUST_ID를
+        # 하드코딩하지 않아 CONTRACT(CNTR_ID) 등 다른 Entity Integration Target도 같은 코드로 처리된다.
+        # 포맷/정렬 기준은 CUSTOMER 때(_assign_customer_ids)와 완전히 동일하다.
+        pk_rows = [c for c in self._target_columns(target_table) if str(c.get("KEY") or "").strip().upper() == "PK"]
+        if len(pk_rows) != 1:
+            raise ValueError(f"{target_table}의 PK 컬럼을 target_model에서 정확히 1개 찾아야 하는데 "
+                              f"{len(pk_rows)}개임 (KEY='PK' 행 필요).")
+        pk_col = pk_rows[0]["COLUMN_NAME"]
+        prefix = pk_col[:-3] if pk_col.upper().endswith("_ID") else pk_col
+        merged = self._assign_sequential_ids(merged, pk_col, prefix,
+                                              order_cols=["_source_batch_id", "_source_record_key"])
         after = merged.count()
+
+        # --- Entity Lineage Crosswalk (요구사항 1-4): 대표 행으로 축약되며 사라지는 원본 lineage도 최종 PK와
+        # 이어 별도 저장한다. singles(단독 레코드)는 lineage=자기 자신의 PK, 병합 그룹은 filled(collapse 전,
+        # 그룹 전원이 살아있는 상태)에서 lineage+match_cols를 뽑아 merged의 최종 pk_col과 match_cols로 join한다.
+        # unmatched(요구사항 3에서 제외)와 같은 이유로, table을 덮어쓰기 전에 먼저 물질화해서 저장한다.
+        pk_by_match = merged.select(*match_cols, pk_col).dropDuplicates(match_cols)
+        lineage_pre_collapse = (singles.select(*lineage_keys, *match_cols)
+                                .unionByName(filled.select(*lineage_keys, *match_cols)))
+        crosswalk = (lineage_pre_collapse.join(pk_by_match, on=match_cols, how="left")
+                    .select(*lineage_keys, F.lit(target_table).alias("TARGET_ENTITY"),
+                            F.col(pk_col).alias("TARGET_PK")))
+        self._save_entity_lineage_crosswalk(target_table, crosswalk)
 
         # gold_candidate.<target>을 읽어서 만든 결과를 같은 테이블에 바로 덮어쓸 수 없다(Spark가 self-overwrite를
         # 막는다) - 임시 테이블에 먼저 물질화한 뒤 그걸 읽어서 원본에 덮어쓴다. unmatched는 위에서 이미 다
@@ -626,3 +814,84 @@ class MappingEngine:
             "unmatched_rows_to_mapping_error": unmatched_n,
         })
         return result
+
+    def _save_entity_lineage_crosswalk(self, target_table: str, crosswalk: DataFrame) -> None:
+        """gold_entity_lineage.<target_table>을 이번 integrate() 계산 기준 전체 스냅샷으로 통째로 덮어쓴다 -
+        candidate 자체가 매번 gold_candidate 전체를 다시 읽어 재계산되므로(save()의 배치 단위 append와 달리),
+        crosswalk도 같은 범위로 맞춰야 탈락한 lineage가 갱신 없이 남거나 지워진 PK를 가리키는 일이 없다.
+        target_table을 그대로 받으므로 CUSTOMER 등 특정 Entity에 하드코딩되지 않는다."""
+        table = cfg.gold_entity_lineage_table(target_table)
+        self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS {cfg.UC_CATALOG}.{cfg.GOLD_ENTITY_LINEAGE_SCHEMA}")
+        tmp_table = f"{table}__crosswalk_tmp"
+        (crosswalk.write.format("delta").mode("overwrite")
+         .option("overwriteSchema", "true").saveAsTable(tmp_table))
+        (self.spark.table(tmp_table).write.format("delta").mode("overwrite")
+         .option("overwriteSchema", "true").saveAsTable(table))
+        self.spark.sql(f"DROP TABLE IF EXISTS {tmp_table}")
+
+    # ------------------------------------------------------------------
+    # Master Data Integration 전용 저장 (예: PRODUCT). run()이 만든 candidate(PK 컬럼은 GENERATE_ID라
+    # NULL)를 gold_candidate.<target_table>에 반영하는데, save()(Direct Mapping/Entity Integration이 쓰는
+    # "소스·배치 단위로 추가/치환")를 그대로 쓰지 않는다 - Master Data는 여러 배치가 누적되는 로그가 아니라
+    # "지금 이 순간의 전체 목록"이라, save()를 그대로 쓰면 재적재할 때마다 같은 자연키(key_column) 행이
+    # 배치별로 쌓여 중복이 생긴다. 그래서 이 메서드가 저장까지 함께 맡는다:
+    #   1) 이미 저장된 값이 있으면 자연키(key_column) 기준으로 id_column을 그대로 이어받는다 (기존 ID 유지)
+    #   2) 처음 보는 자연키에는 새 번호를 발급한다 (_assign_sequential_ids, CUSTOMER의 채번과 공용)
+    #   3) 결과를 가공 없이(=이번 적재의 나머지 컬럼 값 그대로) "새 전체 스냅샷"으로 통째로 교체한다 - 여러
+    #      소스를 매칭/충돌 해소할 필요가 없으니(Master Data가 이미 authoritative) integrate()의
+    #      MATCHING_RULE/CONFLICT_RULE 같은 메타데이터가 필요 없다.
+    # target_table/id_column/key_column/prefix를 호출자가 지정하는 범용 메서드다 - PRODUCT 전용 로직이
+    # 아니라 앞으로 다른 Master Data Integration Target이 생겨도 그대로 재사용한다.
+    # ------------------------------------------------------------------
+    def load_master_data(self, target_table: str, candidate: DataFrame, summary: Dict[str, Any],
+                          id_column: str, key_column: str, prefix: str) -> Dict[str, Any]:
+        target_table = target_table.upper()
+        table = cfg.gold_candidate_table(target_table)
+        error_table = cfg.gold_mapping_error_table(target_table)
+        self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS {cfg.UC_CATALOG}.{cfg.GOLD_CANDIDATE_SCHEMA}")
+        self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS {cfg.UC_CATALOG}.{cfg.GOLD_MAPPING_ERROR_SCHEMA}")
+
+        # save()와 동일하게, 값 변환에 실패한 행(_map_errors)은 gold_candidate에 넣지 않고 error_table로 뺀다.
+        clean = candidate.filter(F.col("_map_errors").isNull())
+        errors = candidate.filter(F.col("_map_errors").isNotNull())
+
+        already_assigned = 0
+        if self.spark.catalog.tableExists(table):
+            existing = self.spark.table(table)
+            already_assigned = existing.filter(F.col(id_column).isNotNull()).count()
+            # 자연키(key_column) 기준으로 기존 id_column만 가져온다 - 같은 키에 값이 여러 번 있었을 리
+            # 없지만(이 메서드 자체가 매번 스냅샷 전체를 교체하므로) 방어적으로 dropDuplicates한다.
+            existing_ids = (existing.filter(F.col(id_column).isNotNull())
+                           .select(key_column, id_column).dropDuplicates([key_column]))
+            clean = clean.drop(id_column).join(existing_ids, on=key_column, how="left")
+        # else: 최초 적재라 재사용할 기존 ID가 없다 - clean의 id_column은 run()이 이미 전부 NULL로 둔 상태.
+
+        assigned = self._assign_sequential_ids(clean, id_column, prefix, order_cols=[key_column])
+
+        # assigned는 (존재한다면) 기존 table을 읽어 만든 DataFrame이므로, 이 값에 기반한 집계는 table을
+        # 덮어쓰기 전에 미리 물질화해 둔다 - integrate()의 unmatched_n과 같은 이유다: 늦게 평가하면 Spark가
+        # 그때 가서 lazy plan을 다시 실행하며 이미 덮어써진(또는 삭제된) table의 예전 파일을 읽으려다 실패한다.
+        after_assigned = assigned.filter(F.col(id_column).isNotNull()).count()
+        error_rows = errors.count()
+
+        # gold_candidate.<target>을 읽어서(존재하는 경우) 만든 결과를 같은 테이블에 바로 덮어쓸 수 없다
+        # (Spark가 self-overwrite를 막는다) - integrate()와 동일하게 임시 테이블을 거쳐 원본에 덮어쓴다.
+        tmp_table = f"{table}__master_load_tmp"
+        (assigned.write.format("delta").mode("overwrite")
+         .option("overwriteSchema", "true").saveAsTable(tmp_table))
+        (self.spark.table(tmp_table).write.format("delta").mode("overwrite")
+         .option("overwriteSchema", "true").saveAsTable(table))
+        self.spark.sql(f"DROP TABLE IF EXISTS {tmp_table}")
+
+        # 변환 오류 행도 마스터 데이터답게 "이번 적재분"으로 통째로 교체한다 (배치 단위 append가 아니다).
+        (errors.write.format("delta").mode("overwrite")
+         .option("overwriteSchema", "true").saveAsTable(error_table))
+
+        summary["mapping_error_rows_excluded"] = error_rows
+        return {
+            "target_table": target_table, "id_column": id_column, "key_column": key_column,
+            "output_rows": after_assigned,
+            "already_assigned_rows": already_assigned,
+            "newly_assigned_rows": after_assigned - already_assigned,
+            "mapping_error_rows_excluded": summary["mapping_error_rows_excluded"],
+        }

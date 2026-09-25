@@ -96,6 +96,41 @@ def derive_rules(target_model_df: DataFrame, target_table: str) -> Tuple[List[Di
     return rows, rules, pk_column
 
 
+_FK_REF_PATTERN = re.compile(r"→\s*([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)")
+
+
+def derive_relationship_specs(target_model_df: DataFrame, target_table: str) -> List[Dict[str, str]]:
+    """target_model에서 KEY='FK'인 컬럼의 DESCRIPTION(예: '→ CUSTOMER.CUST_ID')을 파싱해 관계 검증
+    스펙(참조 테이블/컬럼, rule_id)을 만든다. 실제 참조 테이블 조회는 run()에서 한다(여긴 순수 함수로 유지).
+    derive_rules()와 같은 ordinal seq로 rule_id를 매겨 VR-{TARGET}-{seq:03d}-FK 컨벤션을 따른다."""
+    rows = [r.asDict() for r in target_model_df.filter(F.upper(F.trim("TABLE_NAME")) == target_table.upper())
+            .orderBy(F.col("ORDINAL").cast("int")).collect()]
+    if not rows:
+        raise ValueError(f"TO-BE 모델에 '{target_table}'이(가) 없습니다.")
+
+    specs: List[Dict[str, str]] = []
+    seq = 0
+    for r in rows:
+        col, key, desc = r["COLUMN_NAME"], (r["KEY"] or ""), (r["DESCRIPTION"] or "")
+        keys = [k.strip() for k in key.split(",") if k.strip()]
+        seq += 1
+        if "FK" not in keys:
+            continue
+        m = _FK_REF_PATTERN.search(desc)
+        if not m:
+            raise ValueError(
+                f"{target_table}.{col}은(는) KEY=FK이지만 DESCRIPTION에서 '→ TABLE.COLUMN' 참조를 "
+                f"파싱하지 못했습니다 (DESCRIPTION='{desc}'). meta.target_model을 확인하세요."
+            )
+        specs.append({
+            "rule_id": f"VR-{target_table}-{seq:03d}-FK",
+            "fk_column": col,
+            "ref_table": m.group(1).upper(),
+            "ref_column": m.group(2).upper(),
+        })
+    return specs
+
+
 def _apply_rules(df: DataFrame, rules: List[Dict[str, Any]]) -> DataFrame:
     """각 규칙의 위반 여부를 계산해 '_violations'(콤마 구분 rule_id 목록, 없으면 NULL) 컬럼을 붙인다."""
     parts = []
@@ -155,6 +190,29 @@ class TargetValidator:
         if missing:
             raise ValueError(f"gold_candidate에 Target 컬럼이 없습니다: {missing} (Mapping Engine 결과가 아닌 것으로 보입니다)")
 
+        # Relationship Validation: 기존 rules 리스트에 FK 규칙을 그대로 추가한다 (별도 실행 단계를 만들지 않음 -
+        # _apply_rules()/_remediate_pk_dedup()는 무수정으로 아래에서 한 번에 처리된다).
+        relationship_specs = derive_relationship_specs(self._target_model, target_table)
+        relationship_rules_checked: List[str] = []
+        relationship_rules_skipped: List[Dict[str, str]] = []
+        for spec in relationship_specs:
+            ref_gold_table = cfg.gold_table(spec["ref_table"])
+            if not self.spark.catalog.tableExists(ref_gold_table):
+                # 참조 테이블이 아직 없음 = 데이터 오류가 아니라 실행 순서 문제. FAIL로 만들지 않고 SKIP하되,
+                # "검증 안 함"을 summary에 명시적으로 남겨 PASS로 오인되지 않게 한다.
+                relationship_rules_skipped.append({
+                    "rule_id": spec["rule_id"], "fk_column": spec["fk_column"],
+                    "ref_table": spec["ref_table"], "ref_column": spec["ref_column"],
+                    "reason": f"참조 테이블 {ref_gold_table}이(가) 아직 없습니다 (해당 테이블을 먼저 실행하세요)",
+                })
+                continue
+            ref_ids = [row[0] for row in
+                      self.spark.table(ref_gold_table).select(spec["ref_column"]).distinct().collect()]
+            fk_col = spec["fk_column"]
+            rules.append({"rule_id": spec["rule_id"], "type": "FK", "columns": [fk_col],
+                          "check": lambda c=fk_col, ids=ref_ids: F.col(c).isNotNull() & ~F.col(c).isin(ids)})
+            relationship_rules_checked.append(spec["rule_id"])
+
         checked = _apply_rules(candidate, rules)
         remediated, dedup_fixed = _remediate_pk_dedup(checked, target_table)
         # 보정된 값으로 규칙을 다시 적용한다 (DQ의 재-DQ와 같은 원칙: 보정 후 통과했는지 다시 확인)
@@ -179,6 +237,8 @@ class TargetValidator:
             "violations_by_rule": viol_counts,
             "pk_dedup_fixed": dedup_fixed,
             "rules_applied": [r["rule_id"] for r in rules],
+            "relationship_rules_checked": relationship_rules_checked,
+            "relationship_rules_skipped": relationship_rules_skipped,   # 비어있지 않으면 일부 FK가 검증되지 않은 것
         }
         return passed, failed, summary
 
