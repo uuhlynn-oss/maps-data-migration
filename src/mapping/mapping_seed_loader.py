@@ -1,10 +1,11 @@
 # =============================================================================
 # 매핑 메타데이터 적재 셀 (Databricks 노트북에 셀 하나로 붙여넣어 실행)
 #
-# CSV 3개를 읽어 엔진이 읽는 메타 테이블 3개를 (교체) 적재합니다.
-#   TO-BE 물리 모델      -> meta.target_model             (컬럼 순서를 ORDINAL로 보존)
-#   AS-IS -> TO-BE 코드  -> meta.code_mapping_asis_tobe
-#   컬럼 단위 매핑 정의  -> meta.mapping_definition
+# CSV 4개를 읽어 엔진이 읽는 메타 테이블 4개를 (교체) 적재합니다.
+#   TO-BE 물리 모델        -> meta.target_model             (컬럼 순서를 ORDINAL로 보존)
+#   AS-IS -> TO-BE 코드    -> meta.code_mapping_asis_tobe
+#   컬럼 단위 매핑 정의    -> meta.mapping_definition
+#   Entity 단위 통합 정의  -> meta.entity_integration_definition
 # 아래 경로만 실제 위치(Volume 또는 Workspace 파일)로 바꾸세요. CSV는 UTF-8(BOM 가능)이어야 합니다.
 # =============================================================================
 import pandas as pd
@@ -23,6 +24,9 @@ FILES = {
     # ⚠ 지금은 매번 전체 교체(overwrite)한다. 사람이 검토(REVIEW_STATUS)한 행을 AI 재생성이 덮어쓰면 안 되는 시점이 오면
     #   dq_rule_repository.py처럼 버전 관리(diff 후 바뀐 행만 새 버전 추가, 사람 검토 필드는 보존)로 바꿔야 한다.
     "mapping_definition":      ("mapping_definition.csv",                       cfg.MAPPING_DEFINITION_TABLE),
+    # Entity 단위 통합 정의 (TARGET_ENTITY/INTEGRATION_TYPE/MATCHING_RULE/MATCHING_KEY_COLUMNS/CONFLICT_RULE/
+    # CONFLICT_REFERENCE) - mapping_definition과 같은 HITL 승인 컬럼(REVIEW_STATUS/FINAL_MIGRATION_APPLY_YN)을 쓴다.
+    "entity_integration_definition": ("entity_integration_definition.csv", cfg.ENTITY_INTEGRATION_TABLE),
 }
 
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {cfg.UC_CATALOG}.{cfg.META_SCHEMA}")
@@ -35,6 +39,10 @@ for key, (fname, table) in FILES.items():
         dup = pdf[pdf.MAPPING_ID.duplicated(keep=False)]
         if not dup.empty:
             raise ValueError(f"MAPPING_ID 중복 (적재하지 않음):\n{dup['MAPPING_ID'].to_string(index=False)}")
+    if key == "entity_integration_definition":
+        dup = pdf[pdf.TARGET_ENTITY.duplicated(keep=False)]
+        if not dup.empty:
+            raise ValueError(f"TARGET_ENTITY 중복 (적재하지 않음):\n{dup['TARGET_ENTITY'].to_string(index=False)}")
     # 전부 빈 컬럼이 있어도 타입을 추론하지 못해 실패하지 않도록 모든 컬럼을 STRING으로 명시한다
     schema = StructType([StructField(c, StringType(), True) for c in pdf.columns])
     records = [tuple(None if pd.isna(v) else v for v in row) for row in pdf.itertuples(index=False, name=None)]

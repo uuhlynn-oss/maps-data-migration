@@ -307,13 +307,25 @@ def cln_val_002_datetime(c: Column, kind: str = "TIMESTAMP") -> Column:
     dq_config.*_INPUT_FORMATS 중 하나로 "정확히" 파싱되는 값만 표준 형식 문자열로 바꾼다.
     2026/13/40 같은 잘못된 날짜, '알 수 없음' 같은 값은 파싱에 실패하므로 원본 그대로 남는다(8.6-4).
     (Databricks 서버리스는 ANSI 모드라 to_timestamp는 오류를 던지므로 try_to_timestamp를 쓴다)
+
+    슬래시 구분에 월/일이 한 자리인 값("1990/3/15")은 문자열 0-패딩으로 먼저 "1990/03/15"로 맞춘 뒤 아래
+    2자리 포맷으로 파싱한다. try_to_timestamp에 "yyyy/M/d"(한 자리 허용) 같은 패턴을 직접 추가하면 Spark의
+    신/구 파서 불일치 검사에 걸려 try_to_timestamp가 예외를 삼키지 않고 그대로 던져 배치 전체가 죽는다
+    (실측 확인: SparkUpgradeException/PARSE_DATETIME_BY_NEW_PARSER) - 그래서 패턴을 늘리는 대신 문자열을 미리 맞춘다.
     """
     if kind == "DATE":
         in_formats, out_format = dq_config.DATE_INPUT_FORMATS, dq_config.DATE_STANDARD_FORMAT
     else:
         in_formats, out_format = dq_config.TIMESTAMP_INPUT_FORMATS, dq_config.TIMESTAMP_STANDARD_FORMAT
 
-    parsed = F.coalesce(*[F.try_to_timestamp(c, F.lit(fmt)) for fmt in in_formats])
+    slash_parts = F.split(c, "/")
+    padded = F.when(
+        F.size(slash_parts) == 3,
+        F.concat_ws("/", slash_parts.getItem(0),
+                   F.lpad(slash_parts.getItem(1), 2, "0"), F.lpad(slash_parts.getItem(2), 2, "0"))
+    ).otherwise(c)
+
+    parsed = F.coalesce(*[F.try_to_timestamp(padded, F.lit(fmt)) for fmt in in_formats])
     return F.when(parsed.isNotNull(), F.date_format(parsed, out_format)).otherwise(c)
 
 

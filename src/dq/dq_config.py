@@ -67,8 +67,10 @@ DQ_RESULT_SCHEMA = StructType([
     StructField("target_column", StringType(), True),
     StructField("dimension", StringType(), True),
     StructField("check_count", LongType(), True),
-    StructField("error_count", LongType(), True),
-    StructField("error_rate", DoubleType(), True),
+    StructField("error_count", LongType(), True),        # 최종(자동 Cleansing+재-DQ 후) 잔여 오류 건수
+    StructField("error_rate", DoubleType(), True),        # 최종 오류율 - action_type 판정 기준
+    StructField("initial_error_count", LongType(), True),  # 자동 Cleansing 전 원본 오류 건수
+    StructField("initial_error_rate", DoubleType(), True),  # 자동 Cleansing 전 원본 오류율
     StructField("threshold_rate", DoubleType(), True),
     StructField("result_status", StringType(), True),  # PASS / FAIL
     StructField("error_grade", StringType(), True),    # CRITICAL / HIGH / MEDIUM / LOW / REVIEW / INFO

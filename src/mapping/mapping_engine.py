@@ -22,7 +22,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from pyspark.sql import Column, DataFrame, SparkSession
+from pyspark.sql import Column, DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
 try:
@@ -159,6 +159,17 @@ class MappingEngine:
     def _copy(self, d, name, stype, ctx):
         return F.col(d["SOURCE_COLUMN"]).cast(stype), None, None
 
+    def _format_date(self, d, name, stype, ctx):
+        s = F.trim(F.col(d["SOURCE_COLUMN"]))
+        # DQ Cleansing(CLN-VAL-002)이 Silver 적재 전에 표준 포맷(yyyy-MM-dd)으로 정규화해주므로 Mapping은 그
+        # 표준 포맷만 파싱한다 (새 정규화 로직을 만들지 않는다). plain cast(_copy)를 안 쓰는 이유: ANSI 모드에서
+        # malformed 값을 cast하면 NULL이 아니라 예외가 나서 배치 전체가 죽는다 - try_to_timestamp는 예외 대신
+        # NULL을 돌려주고(이 환경에 try_to_date가 없어 대신 사용, 결과는 동일), 2/30처럼 실존하지 않는 날짜도
+        # 달력 유효성까지 포함해 정확히 NULL로 거부한다(실측 확인됨).
+        parsed = F.try_to_timestamp(s, F.lit(cfg.SOURCE_DATE_FORMAT)).cast(stype)
+        failed = s.isNotNull() & (s != "") & parsed.isNull()
+        return parsed, failed, None
+
     def _format_timestamp(self, d, name, stype, ctx):
         s = F.trim(F.col(d["SOURCE_COLUMN"]))
         tz = F.lit(ctx["source_tz"])
@@ -207,7 +218,15 @@ class MappingEngine:
         # KST 원본이 변환 없이 그대로 들어가는 사고(아웃바운드 CALL_ST_DTM/CALL_END_DTM이 DIRECT/COPY로 선언된 경우 실제 재현됨)가 난다.
         if stype == "timestamp" and key in (("RENAME", "COPY"), ("DIRECT", "COPY"), ("TRANSFORM", "FORMAT")):
             return self._format_timestamp
-        if key in (("RENAME", "COPY"), ("DIRECT", "COPY")):
+        # DATE도 timestamp와 같은 이유로 별도 처리한다: plain cast(_copy)는 ANSI 모드에서 malformed 값에
+        # 예외를 던져 배치 전체를 죽인다 (이번에 실제로 재현된 문제).
+        if stype == "date" and key in (("RENAME", "COPY"), ("DIRECT", "COPY"), ("TRANSFORM", "FORMAT")):
+            return self._format_date
+        # TRANSFORM/FORMAT이 timestamp/date가 아닌 VARCHAR 등이면 여기로 온다. DQ Cleansing이 Silver 적재 전에
+        # 이미 표준 포맷으로 정규화해주므로(CLN-VAL-001 전화번호, CLN-VAL-002 날짜 - dq_config.py 참고), Mapping은
+        # 별도 파싱 없이 캐스트만 하면 된다(_copy와 동일) - 예전엔 여기가 None(미지원)이라 BRTH_DT/TEL_NO가 항상
+        # NULL로 나갔었다.
+        if key in (("RENAME", "COPY"), ("DIRECT", "COPY"), ("TRANSFORM", "FORMAT")):
             return self._copy
         if key == ("CODE", "LOOKUP"):
             return self._code_lookup
@@ -407,3 +426,203 @@ class MappingEngine:
 
         summary["mapping_error_rows_excluded"] = errors.count()
         return table
+
+    # ------------------------------------------------------------------
+    # Entity Integration: Column Mapping(run/save)과 분리된 Entity 단위 통합.
+    # meta.entity_integration_definition(AI 생성 + HITL 승인, mapping_seed_loader.py가 적재)을 target_table
+    # 기준으로 찾아 동적으로 해석한다 - 특정 target_table이나 통합 방식을 코드에 하드코딩하지 않는다.
+    # 모든 소스를 이 target으로 Mapping+save()한 뒤, 이 target에 대해 한 번 호출한다. DIRECT/UNION은 지금 저장
+    # 구조(소스별 replaceWhere)가 이미 그 결과이므로 아무것도 하지 않는다(no-op). MERGE만 실제로 통합한다.
+    # ------------------------------------------------------------------
+    def _integration_spec(self, target_table: str) -> Optional[Dict[str, Any]]:
+        if not self.spark.catalog.tableExists(cfg.ENTITY_INTEGRATION_TABLE):
+            return None
+        rows = (self.spark.read.table(cfg.ENTITY_INTEGRATION_TABLE)
+               .filter(F.upper(F.trim("TARGET_ENTITY")) == target_table.upper())
+               .filter(F.upper(F.trim("FINAL_MIGRATION_APPLY_YN")) == "Y")
+               .filter(F.upper(F.trim("REVIEW_STATUS")).isin(*cfg.APPLY_REVIEW_STATUSES))
+               .collect())
+        return rows[0].asDict() if rows else None
+
+    def _reference_timestamp(self, ref_table: str, ref_column: str) -> Optional[DataFrame]:
+        """CONFLICT_REFERENCE("TARGET_TABLE.TARGET_COLUMN")가 가리키는 컬럼의 원본을, 그 컬럼에 이미 정의된
+        (source_system별) mapping_definition을 그대로 재사용해 Silver에서 읽어온다 - 새 정규화 로직을 만들지
+        않는다. (source_system, source_batch_id, source_record_key) 단위로 값을 돌려준다."""
+        out = None
+        for source_system in cfg.SOURCE_SYSTEMS:
+            defs = [d for d in self._load_definitions(source_system, ref_table) if d["TARGET_COLUMN"] == ref_column]
+            if not defs:
+                continue
+            d = defs[0]
+            stype = _spark_type(next(c["DATA_TYPE"] for c in self._target_columns(ref_table)
+                                     if c["COLUMN_NAME"] == ref_column))
+            handler = self._dispatch(d, stype)
+            if handler is None:
+                continue
+            silver_df = self.spark.read.table(cfg.silver_input_table(cfg.SOURCE_SYSTEMS[source_system]["silver"]))
+            ctx = {"source_tz": cfg.SOURCE_TIMEZONE.get(source_system, cfg.DEFAULT_SOURCE_TIMEZONE)}
+            value, _, _ = handler(d, ref_column, stype, ctx)
+            part = silver_df.select("_source_system", "_source_batch_id", "_source_record_key",
+                                    value.alias("_ref_ts"))
+            out = part if out is None else out.unionByName(part)
+        return out
+
+    def _assign_customer_ids(self, df: DataFrame) -> DataFrame:
+        """CUST_ID가 없는(=한 번도 배정 안 된 신규) 행에만 'CUST-000001' 형식으로 순번을 채운다 (PoC 수준).
+        전체에 row_number()를 다시 매기지 않고, 기존 CUST_ID 중 최대 번호 다음부터 신규 행에만 이어서 부여한다
+        - 이미 배정된 값이 있는 행은 이 함수에 오기 전에(fill_cols의 first(ignorenulls=True)) 이미 보존되어
+        CUST_ID가 채워진 채로 들어오므로 여기서는 손대지 않는다."""
+        if "CUST_ID" not in df.columns:
+            return df
+        existing_n = (df.filter(F.col("CUST_ID").isNotNull())
+                     .select(F.regexp_extract(F.col("CUST_ID"), r"^CUST-(\d+)$", 1).cast("int").alias("n"))
+                     .agg(F.max("n")).collect()[0][0]) or 0
+
+        with_id = df.filter(F.col("CUST_ID").isNotNull())
+        without_id = df.filter(F.col("CUST_ID").isNull())
+        if without_id.limit(1).count() == 0:
+            return with_id
+
+        # 배치·레코드키 순으로 정렬해 채번 순서를 결정적으로 만든다 (재실행해도 같은 입력이면 같은 순서).
+        w = Window.orderBy("_source_batch_id", "_source_record_key")
+        new_ids = (without_id
+                  .withColumn("_seq", F.row_number().over(w) + F.lit(existing_n))
+                  .withColumn("CUST_ID", F.format_string("CUST-%06d", F.col("_seq")))
+                  .drop("_seq"))
+        return with_id.unionByName(new_ids)
+
+    def integrate(self, target_table: str) -> Dict[str, Any]:
+        target_table = target_table.upper()
+        spec = self._integration_spec(target_table)
+        integration_type = (spec or {}).get("INTEGRATION_TYPE", "DIRECT")
+        result = {"target_table": target_table, "integration_type": integration_type}
+
+        if integration_type in ("DIRECT", "UNION"):
+            result["note"] = "저장 구조가 이미 이 결과와 같아 변경 없음 (no-op)"
+            return result
+        if integration_type != "MERGE":
+            raise ValueError(f"지원하지 않는 INTEGRATION_TYPE입니다: {integration_type}")
+
+        matching_rule = spec.get("MATCHING_RULE")
+        if matching_rule != "NAME_DOB_PHONE_EXACT":
+            raise ValueError(f"지원하지 않는 MATCHING_RULE입니다: {matching_rule} (현재 NAME_DOB_PHONE_EXACT만 구현됨)")
+        conflict_rule = spec.get("CONFLICT_RULE")
+        if conflict_rule != "LATEST_NON_NULL":
+            raise ValueError(f"지원하지 않는 CONFLICT_RULE입니다: {conflict_rule} (현재 LATEST_NON_NULL만 구현됨)")
+
+        match_cols = [c.strip() for c in (spec.get("MATCHING_KEY_COLUMNS") or "").split(",") if c.strip()]
+        if not match_cols:
+            raise ValueError("MATCHING_KEY_COLUMNS가 비어 있습니다.")
+        ref = (spec.get("CONFLICT_REFERENCE") or "").split(".")
+        if len(ref) != 2:
+            raise ValueError(f"CONFLICT_REFERENCE 형식이 'TARGET_TABLE.TARGET_COLUMN'이 아닙니다: {spec.get('CONFLICT_REFERENCE')}")
+        ref_table, ref_column = ref[0].strip(), ref[1].strip()
+
+        table = cfg.gold_candidate_table(target_table)
+        if not self.spark.catalog.tableExists(table):
+            result["note"] = f"{table} 없음 (아직 Mapping 실행 전)"
+            return result
+        candidate = self.spark.table(table)
+        before = candidate.count()
+        target_cols = [c for c in candidate.columns if not c.startswith("_")]
+        lineage_keys = ["_source_system", "_source_batch_id", "_source_record_key"]
+
+        # 매칭 키가 전부 채워진 행만 "확실한 Matching" 대상으로 본다. 하나라도 NULL이면 동일 고객인지 확신할
+        # 수 없어 자동으로 합치지 않는다 - gold_mapping_error(이 단계에서 확정 못 한 후보를 위한 기존 구조)로 보낸다.
+        matchable = candidate
+        for c in match_cols:
+            matchable = matchable.filter(F.col(c).isNotNull())
+        key_missing = candidate.join(matchable.select(*lineage_keys), on=lineage_keys, how="left_anti")
+
+        ref_ts = self._reference_timestamp(ref_table, ref_column)
+        if ref_ts is None:
+            raise ValueError(f"CONFLICT_REFERENCE({ref_table}.{ref_column})에 대응하는 mapping_definition을 찾지 못했습니다.")
+        # 소스가 재처리 등으로 같은 레코드를 중복으로 갖고 있을 가능성에 대비해 방어적으로 1건만 남긴다
+        # (join fan-out으로 그룹 크기가 부풀어 정상 단독 레코드까지 충돌로 오판하는 걸 막는다).
+        ref_ts = ref_ts.dropDuplicates(lineage_keys)
+        matchable = matchable.join(ref_ts, on=lineage_keys, how="left")
+
+        fill_cols = [c for c in target_cols if c not in match_cols]
+        w_group = Window.partitionBy(*match_cols)
+
+        # 매칭 키가 같은 레코드가 "몇 개"인지로 먼저 나눈다: 다른 Source(또는 같은 Source의 다른 레코드)에
+        # 동일 키가 없으면(그룹 크기 1) 애초에 합칠 대상이 없으므로 conflict 검사 자체가 의미 없다 - 그대로
+        # 정상 CUSTOMER 행이 된다. 그룹 크기가 2 이상인 경우에만 LATEST_NON_NULL/충돌 판단을 적용한다.
+        matchable = matchable.withColumn("_grp_size", F.count(F.lit(1)).over(w_group))
+        singles = matchable.filter(F.col("_grp_size") == 1).drop("_grp_size", "_ref_ts")
+        groups = matchable.filter(F.col("_grp_size") > 1).drop("_grp_size")
+
+        # 같은 시각(=최신 시각이 동률)에 서로 다른 non-null 값이 있으면 시간만으로는 어느 값이 맞는지 판단할 수 없다
+        # (6번 요구사항) - 이런 컬럼이 하나라도 있는 그룹(2개 이상 레코드)은 자동 병합하지 않고 gold_mapping_error로
+        # 보낸다 (새 승인 테이블을 만들지 않고 기존 "이 단계에서 확정 못 한 후보" 구조를 그대로 재사용).
+        top_ts = F.max(F.col("_ref_ts")).over(w_group)
+        at_top = (groups.withColumn("_top_ts", top_ts)
+                 .filter((F.col("_ref_ts") == F.col("_top_ts"))
+                         | (F.col("_ref_ts").isNull() & F.col("_top_ts").isNull()))
+                 .drop("_top_ts"))
+        conflict_groups = None
+        for c in fill_cols:
+            dc = (at_top.filter(F.col(c).isNotNull()).groupBy(*match_cols)
+                 .agg(F.countDistinct(c).alias("_n")).filter(F.col("_n") > 1).select(*match_cols))
+            conflict_groups = dc if conflict_groups is None else conflict_groups.unionByName(dc).distinct()
+
+        if conflict_groups is not None and conflict_groups.limit(1).count() > 0:
+            conflicting = groups.join(conflict_groups, on=match_cols, how="inner").drop("_ref_ts")
+            clean_groups = groups.join(conflict_groups, on=match_cols, how="left_anti")
+        else:
+            conflicting = None
+            clean_groups = groups
+
+        unmatched = key_missing if conflicting is None else key_missing.unionByName(conflicting)
+
+        # unmatched는 candidate/table을 나중에 덮어쓰기 전에 먼저 완전히 처리(count+저장)해서 물질화한다.
+        # candidate가 여기서 쓰는 table을 아래에서 덮어쓰는데, Spark는 그 시점에 이 table을 가리키는 캐시되지
+        # 않은 DataFrame(candidate/unmatched)을 무효화해서 다시 읽으므로, 늦게 평가하면 덮어쓴 결과를 다시
+        # 읽어버려 틀린 값이 나온다.
+        unmatched_n = unmatched.count()
+        if unmatched_n > 0:
+            error_table = cfg.gold_mapping_error_table(target_table)
+            self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS {cfg.UC_CATALOG}.{cfg.GOLD_MAPPING_ERROR_SCHEMA}")
+            if not self.spark.catalog.tableExists(error_table):
+                unmatched.limit(0).write.format("delta").mode("overwrite") \
+                    .partitionBy("_source_batch_id").saveAsTable(error_table)
+            unmatched.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(error_table)
+
+        # 여러 레코드가 있는(충돌 없는) 그룹만 LATEST_NON_NULL로 컬럼별 채움 후 1행으로 축약한다.
+        # 단독 레코드(singles)는 합칠 대상이 없으므로 그대로 쓴다 (충돌 판단/채움 로직 적용 안 함).
+        w_latest_first = w_group.orderBy(F.desc_nulls_last("_ref_ts")).rowsBetween(
+            Window.unboundedPreceding, Window.unboundedFollowing)
+        filled = clean_groups
+        for c in fill_cols:
+            filled = filled.withColumn(c, F.first(F.col(c), ignorenulls=True).over(w_latest_first))
+        w_rank = w_group.orderBy(F.desc_nulls_last("_ref_ts"))
+        collapsed = (filled.withColumn("_conflict_rank", F.row_number().over(w_rank))
+                    .filter(F.col("_conflict_rank") == 1)
+                    .drop("_conflict_rank", "_ref_ts"))
+
+        merged = singles.unionByName(collapsed)
+
+        # CUST_ID 채번 (PoC 수준 - MAX+1, row_number 전체 재부여 아님). fill_cols 루프가 CUST_ID도 이미
+        # first(ignorenulls=True)로 처리해서 "기존에 배정된 값 보존"은 여기 오기 전에 끝나 있다 - 여기서는
+        # 그래도 NULL로 남은(=한 번도 배정 안 된 진짜 신규) 행에만 새 번호를 채운다.
+        merged = self._assign_customer_ids(merged)
+        after = merged.count()
+
+        # gold_candidate.<target>을 읽어서 만든 결과를 같은 테이블에 바로 덮어쓸 수 없다(Spark가 self-overwrite를
+        # 막는다) - 임시 테이블에 먼저 물질화한 뒤 그걸 읽어서 원본에 덮어쓴다. unmatched는 위에서 이미 다
+        # 처리했으므로 이제 table을 덮어써도 안전하다.
+        tmp_table = f"{table}__integrate_tmp"
+        (merged.write.format("delta").mode("overwrite")
+         .option("overwriteSchema", "true").saveAsTable(tmp_table))
+        (self.spark.table(tmp_table).write.format("delta").mode("overwrite")
+         .option("overwriteSchema", "true").saveAsTable(table))
+        self.spark.sql(f"DROP TABLE IF EXISTS {tmp_table}")
+
+
+        result.update({
+            "matching_rule": matching_rule, "matching_key_columns": match_cols,
+            "conflict_rule": conflict_rule, "conflict_reference": f"{ref_table}.{ref_column}",
+            "input_rows": before, "merged_rows": after,
+            "unmatched_rows_to_mapping_error": unmatched_n,
+        })
+        return result

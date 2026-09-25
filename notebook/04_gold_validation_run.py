@@ -16,7 +16,7 @@
 
 # COMMAND ----------
 
-TARGET_TABLE = "COMPLAINT"
+TARGET_TABLE = "CUSTOMER"
 SAVE = True          # False면 저장 없이 결과만 확인
 
 # COMMAND ----------

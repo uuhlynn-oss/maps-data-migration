@@ -933,7 +933,19 @@ class DQRunner:
         else:
             raise ValueError(f"지원하지 않는 Rule Type입니다: {rule_type}")
 
-        judgment = self.judge_result(rule, res["check_count"], res["error_count"])
+        # 자동 Cleansing 수행 여부를 action_type(임계치 판정)에 종속시키지 않는다: 정제 가능하면 임계치와
+        # 무관하게 먼저 정제+재-DQ를 수행하고, "정제 후 남은 오류"를 기준으로 최종 action_type을 판정한다.
+        # (정제 전 오류율로 먼저 판정하면, 오류율이 임계치 이하일 때 정제 가능한 위반도 조용히 건너뛰게 된다.)
+        initial_error_count = res["error_count"]
+        initial_error_rate = round(initial_error_count / res["check_count"], 6) if res["check_count"] > 0 else 0.0
+        cleansing_cfg = dq_config.cleansing_config_for(rule)
+        applied_df = None
+        post_error_count = initial_error_count
+        if initial_error_count > 0 and cleansing_cfg and res.get("error_df") is not None:
+            applied_df = self.cleansing.apply(res["error_df"], rule, cleansing_cfg)
+            post_error_count = applied_df.filter(~F.col(f"{_TMP}re_dq_pass")).count()
+
+        judgment = self.judge_result(rule, res["check_count"], post_error_count)
         target_col = rule.get("column") or ", ".join(rule.get("columns", []))
         action_type = judgment["action_type"]
 
@@ -941,7 +953,6 @@ class DQRunner:
         # 오류가 하나라도 있으면 임계치와 무관하게(ALLOW 포함) 위반 레코드를 전부 기록한다.
         # (요청서 §1/§3.4/§9: 규칙 집계에서 행 단위 상세로 연결, 규칙별/실행 전체 고유 오류 레코드 수 산출.
         #  처리 여부는 cleansing_status / review_required_yn 으로 구분한다.)
-        # 정제·격리 대상은 여전히 ALLOW가 아닌 Rule뿐이다. ALLOW 위반은 원본 유지(요청서 §6) -> NOT_REQUIRED로 기록만 한다.
         # 오류가 없는 Rule은 detail_df를 아예 안 쓴다 (detail_df 자체는 res에서 lazy하게만 만들어져 있음).
         detail_df = None
         unique_error_record_count = None
@@ -949,16 +960,14 @@ class DQRunner:
         unresolved_record_count = None
         if res["error_count"] > 0 and res.get("detail_df") is not None:
             now = datetime.now()
-            cleansing_cfg = dq_config.cleansing_config_for(rule)
 
-            if action_type != "ALLOW" and cleansing_cfg and res.get("error_df") is not None:
-                # DQ 기준서 8.10: Cleansing Rule 있음 -> 자동 Cleansing -> 재-DQ
-                #   PASS -> AUTO_CLEANSED / FAIL -> 남은 위반은 action_type에 따라 UNRESOLVED(격리) 또는 ALLOWED(허용)
-                # 마스킹 전 원문이 필요하므로 res["detail_df"]가 아니라 error_df를 쓴다.
-                applied_df = self.cleansing.apply(res["error_df"], rule, cleansing_cfg)
+            if applied_df is not None:
+                # DQ 기준서 8.10: Cleansing Rule 있음 -> 자동 Cleansing -> 재-DQ (임계치 무관하게 이미 위에서 수행함)
+                #   PASS -> AUTO_CLEANSED / FAIL -> 남은 위반은 (정제 후 판정된) action_type에 따라
+                #   UNRESOLVED(격리) 또는 ALLOWED(허용). build_detail_df가 행 단위로 정확히 채워준다.
                 base_df = self.cleansing.build_detail_df(applied_df, record_key_col, rule, action_type)
             else:
-                # 정제하지 않는 경우 (Cleansing Rule 없음 - 기준서 8.9 / 허용 오류율 이내 ALLOW):
+                # 정제하지 않는 경우 (Cleansing Rule 없음 - 기준서 8.9 / 애초에 정제 대상 위반이 없었음):
                 #   BLOCK/REVIEW -> UNRESOLVED(격리) / WARN -> ALLOWED(허용, 로그만) / ALLOW -> NOT_REQUIRED(원본 유지)
                 # 값을 추정해서 채우지 않으므로 proposed/final_value는 NULL로 남긴다.
                 isolate = action_type in dq_config.ISOLATE_ACTIONS
@@ -1014,8 +1023,12 @@ class DQRunner:
             "target_column": target_col,
             "dimension": rule.get("dimension", ""),
             "check_count": res["check_count"],
-            "error_count": res["error_count"],
+            "error_count": post_error_count,   # 정제 후 잔여 오류 기준 (judgment의 error_rate와 정합성 유지)
             "error_rate": judgment["error_rate"],
+            # ---- 정제 전/후 구분 (요청 반영분). DQ_RESULT_SCHEMA(dq_config.py)엔 없는 필드라 _save_dq_results가
+            # 테이블에 저장할 땐 자동으로 무시되고, 이 함수의 반환값(run_table_dq의 cleansing_specs 계산 등)에서만 쓰인다.
+            "initial_error_count": initial_error_count,
+            "initial_error_rate": initial_error_rate,
             "threshold_rate": rule.get("threshold_rate", 0.0),
             "result_status": judgment["result_status"],
             "error_grade": judgment["error_grade"],
@@ -1086,17 +1099,22 @@ class DQRunner:
         self._save_dq_results(results)
         self._save_cleansing_details(detail_dfs)
 
-        # 정제·격리 대상은 허용 오류율을 넘긴(ALLOW가 아닌) Rule뿐이다. ALLOW Rule의 위반은 detail에 NOT_REQUIRED로
-        # 기록만 되고 candidate에서는 원본 그대로 통과한다. (detail의 AUTO_CLEANSED/UNRESOLVED 건과 candidate/격리 대상은 항상 같은 Rule 집합)
+        # execute_rule()이 이제 "정제 후" action_type을 돌려주므로, 격리 판단(detail_rules/isolate_rules)은
+        # 기존처럼 최종 action_type 기준을 그대로 쓴다.
         rules_by_id = {r["rule_id"]: r for r in rules}
         detail_rules = [r for r in results if r["action_type"] != "ALLOW" and (r["error_count"] or 0) > 0]
-        # 자동 Cleansing은 Cleansing Rule이 매핑된 Rule에만 적용 (WARN 포함 - 결정적 규칙이라 보정해도 안전하다)
+        # 격리 판정은 "정제 후" action_type이 BLOCK/REVIEW인 Rule만 (WARN은 허용이라 위반이 남아도 레코드는 통과)
+        isolate_rules = [rules_by_id[r["rule_id"]] for r in detail_rules if r["action_type"] in dq_config.ISOLATE_ACTIONS]
+
+        # 자동 Cleansing 적용 대상(cleansing_specs)은 최종 action_type과 무관하게 "정제 전(initial) 위반이 있었고
+        # Cleansing Rule이 매핑된 Rule 전부"여야 한다 - 그래야 정제로 완전히 해소돼 최종 action_type이 ALLOW가 된
+        # Rule도 silver_candidate에 정제값이 반영된다 (안 그러면 dq_cleansing_detail엔 AUTO_CLEANSED로 찍히는데
+        # 정작 candidate 값은 원본 그대로 남는 불일치가 생긴다). 자동 Cleansing 여부와 최종 격리 여부는 별개 게이트다.
         cleansing_specs = [
             (rules_by_id[r["rule_id"]], dq_config.cleansing_config_for(rules_by_id[r["rule_id"]]))
-            for r in detail_rules if dq_config.cleansing_config_for(rules_by_id[r["rule_id"]]) is not None
+            for r in results if (r.get("initial_error_count") or 0) > 0
+            and dq_config.cleansing_config_for(rules_by_id[r["rule_id"]]) is not None
         ]
-        # 격리 판정은 BLOCK/REVIEW Rule만 (WARN은 허용이라 위반이 남아도 레코드는 통과)
-        isolate_rules = [rules_by_id[r["rule_id"]] for r in detail_rules if r["action_type"] in dq_config.ISOLATE_ACTIONS]
         candidate_row_count, quarantine_row_count = self._save_candidate_and_quarantine(
             df, target_table, source_batch_id, cleansing_specs, isolate_rules
         )

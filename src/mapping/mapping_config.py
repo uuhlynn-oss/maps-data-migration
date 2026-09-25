@@ -44,9 +44,12 @@ SOURCE_SYSTEMS = {
 # 다음 단계에서 다룬다. 그때까지 실행하면 "상담 1건당 1행"이 나와 잘못된 결과가 되므로 막아 둔다.
 # COMPLAINT(HOMEPAGE)는 target_model/mapping_definition 확인 결과 NOT NULL 컬럼(CMPL_ID/CMPL_CNTNT/REG_DTM)이
 # 전부 이 엔진이 지원하는 매핑 타입(RENAME/COPY, TIMESTAMP FORMAT)으로 커버되어 1:1로 안전해 추가한다.
-# CUSTOMER(CUST_ID PK 매핑 자체가 없음)/CONTRACT(PK·FK가 DERIVED/GENERATE_ID·LOOKUP으로만 정의돼 엔진 미지원)/
-# COUNSEL_DETAIL(PK 매핑 없음 + EXPLODE로 실제 1:N)/PRODUCT(mapping_definition 행 자체가 없음)는 계속 제외한다.
-SUPPORTED_TARGET_TABLES = ("COUNSEL", "COMPLAINT")
+# CUSTOMER는 여러 소스 행이 하나로 합쳐지는 테이블이라 예전엔 막혀 있었지만, mapping_config.ENTITY_INTEGRATION_TABLE +
+# MappingEngine.integrate()로 Entity Integration(MERGE)을 별도 단계로 실행하게 되어 추가한다 - integrate()를
+# 반드시 모든 소스의 run()/save()가 끝난 뒤 한 번만 호출해야 한다 (03_mapping_run.py의 RUN_INTEGRATION 참고).
+# CONTRACT(PK·FK가 DERIVED/GENERATE_ID·LOOKUP으로만 정의돼 엔진 미지원)/COUNSEL_DETAIL(PK 매핑 없음 + EXPLODE로
+# 실제 1:N)/PRODUCT(mapping_definition 행 자체가 없음)는 계속 제외한다.
+SUPPORTED_TARGET_TABLES = ("COUNSEL", "COMPLAINT", "CUSTOMER")
 
 # 실행 대상 매핑 행 조건: FINAL_MIGRATION_APPLY_YN = 'Y' 이고 REVIEW_STATUS가 아래 중 하나
 APPLY_REVIEW_STATUSES = ("APPROVED", "MODIFIED_APPROVED")
@@ -63,8 +66,24 @@ SOURCE_TIMEZONE = {
     "INBOUND": "Asia/Seoul",
 }
 SOURCE_TIMESTAMP_FORMAT = "yyyy-MM-dd HH:mm:ss"   # 표준 포맷 - DQ Cleansing(CLN-VAL-002)이 모든 소스를 이 형식으로 정규화한다.
+SOURCE_DATE_FORMAT = "yyyy-MM-dd"   # 표준 포맷 - DQ Cleansing(CLN-VAL-002, DATE_STANDARD_FORMAT과 동일 값)이 정규화한다.
 
 # ---- 정책 (잠정) ----
 # 승인된 코드 매핑이 없는 값(REVIEW 포함)은 격리하지 않고 NULL로 적재하고, 원천 값을 _unmapped_codes에 남긴다.
 # (TO-BE의 해당 코드 컬럼이 모두 NULL 허용이고, 격리하면 레코드 손실이 커서 잠정으로 이렇게 둔다 - 확정 필요)
 UNMAPPED_CODE_POLICY = "NULL_AND_RECORD"
+
+# ---------------------------------------------------------------------------
+# Entity Integration Definition: 여러 소스가 같은 Target Entity로 합쳐질 때 "어떻게 통합할지"는
+# Column Mapping(MAPPING_TYPE/PROCESS_TYPE)만으로 표현할 수 없어 별도 메타데이터로 관리한다.
+# AI가 생성하고 HITL이 승인한 CSV(entity_integration_definition.csv, mapping_seed_loader.py 참고)를
+# meta.entity_integration_definition 테이블로 적재해, Engine이 target_table마다 동적으로 해석한다.
+# 코드에 특정 Target 이름이나 통합 방식을 하드코딩하지 않는다 - 이 테이블에 없는 target_table은 DIRECT로 본다.
+# 컬럼: TARGET_ENTITY, INTEGRATION_TYPE(DIRECT/UNION/MERGE), MATCHING_RULE, MATCHING_KEY_COLUMNS(콤마구분,
+#      Target 컬럼명 기준), CONFLICT_RULE, CONFLICT_REFERENCE("TARGET_TABLE.TARGET_COLUMN" 형식 - 예:
+#      "COUNSEL.STRT_DTM". CONFLICT_RULE=LATEST_CONSULTATION일 때 어느 표준 컬럼을 "상담일시"로 볼지 가리킨다.
+#      기존 mapping_definition에 이 (target_table,target_column)에 대한 (source_system,source_table)별
+#      SOURCE_COLUMN 매핑이 이미 있다고 가정하고 그걸 그대로 재사용한다 - 새 정규화 로직을 만들지 않는다),
+#      REVIEW_STATUS/FINAL_MIGRATION_APPLY_YN(기존 mapping_definition과 같은 HITL 승인 컬럼, 같은 값 재사용).
+# ---------------------------------------------------------------------------
+ENTITY_INTEGRATION_TABLE = f"{UC_CATALOG}.{META_SCHEMA}.entity_integration_definition"
