@@ -4,116 +4,96 @@
 # environment_version = "5"
 # ///
 # MAGIC %md
-# MAGIC # Target Validation 실행: gold_candidate → Gold / gold_quarantine / MIGRATION_TRACE
+# MAGIC # Target Validation 실행: target_model 기반 자동 실행
 # MAGIC
-# MAGIC ⚠️ **운영 순서 주의(Relationship Validation)**: TARGET_TABLE이 target_model DESCRIPTION에 `→ TABLE.COLUMN`
-# MAGIC 형태로 다른 테이블을 FK 참조한다면, 참조 대상 테이블을 **먼저** 이 노트북으로 실행해 `gold.<참조테이블>`을
-# MAGIC 채워둬야 FK가 실제로 검증됩니다. 참조 테이블이 아직 없으면 FAIL이 아니라 SKIP되며(§3에서 확인),
-# MAGIC `summary["relationship_rules_skipped"]`에 어떤 FK가 검증되지 않았는지 남습니다 — 비어 있지 않으면 PASS를
-# MAGIC 전부 신뢰하지 말고 참조 테이블을 먼저 실행한 뒤 재실행하세요.
+# MAGIC 이전 버전은 `TARGET_TABLE`을 노트북 파라미터로 하나씩 지정했다. 이제
+# MAGIC `mapping_orchestrator.discover_execution_targets()`(Mapping Execution과 동일한 함수 재사용 - "실행
+# MAGIC 가능한 Target이 무엇인가"라는 질문 자체가 두 단계에서 같다)로 대상을 자동 조회해 순회한다.
+# MAGIC `gold_validation_runner.py`의 `TargetValidator` 로직 자체는 수정하지 않았다.
 # MAGIC
-# MAGIC `03_mapping_run.py`를 먼저 실행해 `gold_candidate.<target>` 물리 테이블을 만들어 두면, 이 노트북은
-# MAGIC **별도 세션/새 클러스터에서 나중에 실행해도 됩니다.** `gold_candidate`는 Mapping Engine이 저장한 물리 Delta
-# MAGIC 테이블이라(임시 뷰 아님) 세션이 끝나도 남아 있습니다. 이 테이블에는 `_map_errors`가 있던(값 변환 실패) 행은
-# MAGIC 애초에 들어오지 않으므로(별도 `<target>_mapping_error` 테이블로 분리 저장됨), 여기서 나오는 격리(`gold_quarantine`)는
-# MAGIC 오직 "Mapping은 끝났지만 TO-BE 품질/업무 규칙을 만족 못한" 경우만 의미합니다.
-# MAGIC
-# MAGIC **이 노트북이 하는 일**: 통합 후보 확인 → 검증 실행(15개 규칙 + CTI_ID 중복 보정) → 요약 → 위반 규칙 분포 → 저장(Gold/격리/MIGRATION_TRACE) → 결과 확인
+# MAGIC ⚠️ **FK 참조 순서 주의는 여전히 유효하다**: 참조 대상 Target이 먼저 검증·저장(`gold.<table>`)되어
+# MAGIC 있어야 그 FK가 실제로 검증된다(`summary["relationship_rules_skipped"]`가 비어 있지 않으면 일부 FK가
+# MAGIC 검증되지 않은 것). `discover_execution_targets()`가 돌려주는 순서(`SUPPORTED_TARGET_TABLES` 순서 -
+# MAGIC CUSTOMER가 CONTRACT보다 앞)가 이 순서를 그대로 지켜준다.
 
 # COMMAND ----------
 
-TARGET_TABLE = "CONTRACT"
-SAVE = True          # False면 저장 없이 결과만 확인
+SAVE = True  # False면 저장 없이 결과만 확인
 
 # COMMAND ----------
 
+import os
 import sys
-from pyspark.sql import functions as F
 
-if "PROJECT_ROOT" in dir() and PROJECT_ROOT and PROJECT_ROOT not in sys.path:
-    sys.path.append(PROJECT_ROOT)
+for _p in sys.path:
+    _parent = os.path.dirname(_p)
+    if os.path.isdir(os.path.join(_parent, "src")) and _parent not in sys.path:
+        sys.path.insert(0, _parent)
+        break
+
 try:
     import src.gold.gold_validation_config as gcfg
     import src.gold.gold_validation_runner as gv
+    import src.mapping.mapping_orchestrator as orch  # discover_execution_targets()만 재사용
 except ModuleNotFoundError:
     import gold_validation_config as gcfg
     import gold_validation_runner as gv
-
-
-def _show(df, n=10):
-    try:
-        display(df.limit(n))
-    except NameError:
-        df.show(n, False)
-
-
-# COMMAND ----------
-
-# MAGIC %md ## 1. 통합 후보 확인
-# MAGIC `mapping_run.py`(또는 `mapping_run_all.py`)가 저장한 `gold_candidate.<target>` 물리 테이블입니다.
-# MAGIC 다른 세션/다른 노트북에서 저장한 것도 여기서 그대로 보입니다.
-
-# COMMAND ----------
-
-candidate_table = gcfg.gold_candidate_table(TARGET_TABLE)
-if not spark.catalog.tableExists(candidate_table):
-    raise RuntimeError(f"{candidate_table}이(가) 없습니다. mapping_run.py 또는 mapping_run_all.py를 먼저 실행하세요.")
-
-candidate = spark.table(candidate_table)
-print(f"{candidate_table}: {candidate.count()}행")
-candidate.groupBy("_source_system").count().show()
-
-# COMMAND ----------
-
-# MAGIC %md ## 2. 검증 실행
-# MAGIC TO-BE 모델에서 규칙을 다시 만들고(모델이 바뀌면 규칙도 같이 바뀝니다), 승인된 보정(CTI_ID 중복 → CNSL_ID 재발급, Review R3)을 적용한 뒤 재검증합니다.
-
-# COMMAND ----------
+    import mapping_orchestrator as orch
 
 validator = gv.TargetValidator.from_tables(spark)
-passed, failed, summary = validator.run(TARGET_TABLE, candidate=candidate)
-
-print("validation_run_id:", summary["validation_run_id"])
-match = summary["input_count"] == summary["loaded_count"] + summary["quarantined_count"]
-print(f"입력 {summary['input_count']} = 적재 {summary['loaded_count']} + 격리 {summary['quarantined_count']}  "
-     f"{'✅ 대사 일치' if match else '❌ 불일치'}")
-print(f"CTI_ID 중복 보정: {summary['pk_dedup_fixed']}건 (Review R3, 아웃바운드만 대상)")
-print(f"\n적용된 규칙 {len(summary['rules_applied'])}개:", summary["rules_applied"])
 
 # COMMAND ----------
 
-# MAGIC %md ## 3. 위반 규칙 분포
+# MAGIC %md ## 1. 검증 대상 자동 조회
+# MAGIC Mapping Execution과 동일한 목록(target_model ∩ SUPPORTED_TARGET_TABLES)을 그대로 쓴다.
 
 # COMMAND ----------
 
-if summary["violations_by_rule"]:
-    for rule_id, cnt in sorted(summary["violations_by_rule"].items(), key=lambda kv: -kv[1]):
-        print(f"  {rule_id:<28}{cnt}건")
-    print("\n격리 사유 샘플 (최대 10건)")
-    _show(failed.select("_source_system", "_source_record_key", "_violations"), 10)
-else:
-    print("위반 없음 (격리된 레코드가 없습니다)")
+targets = orch.discover_execution_targets(spark)
+print(f"Validation 대상 (target_model ∩ SUPPORTED_TARGET_TABLES): {targets}")
 
 # COMMAND ----------
 
-# MAGIC %md ## 4. 결과 미리보기 (Gold 형태)
+# MAGIC %md ## 2. Target별 순차 검증
 
 # COMMAND ----------
 
-_show(passed, 10)
+summaries = {}
+for target_table in targets:
+    print(f"\n{'=' * 60}\n[{target_table}] Validation 시작\n{'=' * 60}")
+
+    candidate_table = gcfg.gold_candidate_table(target_table)
+    if not spark.catalog.tableExists(candidate_table):
+        print(f"⚠️  {candidate_table} 없음 - 03_mapping_run.py를 먼저 실행하세요. 이 Target은 건너뜁니다.")
+        continue
+
+    passed, failed, summary = validator.run(target_table)
+    summaries[target_table] = summary
+
+    match = summary["input_count"] == summary["loaded_count"] + summary["quarantined_count"]
+    print(f"입력 {summary['input_count']} = 적재 {summary['loaded_count']} + 격리 {summary['quarantined_count']} "
+          f"{'✅ 대사 일치' if match else '❌ 불일치'}")
+    if summary["violations_by_rule"]:
+        for rule_id, cnt in sorted(summary["violations_by_rule"].items(), key=lambda kv: -kv[1]):
+            print(f"    위반 {rule_id}: {cnt}건")
+    if summary["relationship_rules_skipped"]:
+        print(f"⚠️  검증되지 않은 FK (참조 테이블이 아직 없음): {summary['relationship_rules_skipped']}")
+
+    if SAVE:
+        tables = validator.save(passed, failed, summary)
+        for label, tbl in tables.items():
+            print(f"✅ {label}: {tbl}")
+    else:
+        print("SAVE=False: 저장하지 않았습니다.")
 
 # COMMAND ----------
 
-# MAGIC %md ## 5. 저장
-# MAGIC Gold Target 테이블(append), gold_quarantine(소스·배치 단위 교체), MIGRATION_TRACE(모든 원천 레코드, 추가 전용).
+# MAGIC %md ## 3. 전체 결과 요약
 
 # COMMAND ----------
 
-if SAVE:
-    tables = validator.save(passed, failed, summary)
-    for label, tbl in tables.items():
-        print(f"✅ {label}: {tbl}")
-    gold_n = spark.read.table(tables["gold_table"])
-    print(f"\n{tables['gold_table']}: 이번 실행 적재분 {summary['loaded_count']}행 (테이블 전체 {gold_n.count()}행, 재실행 시 누적 - 알려진 제약)")
-else:
-    print("SAVE=False: 저장하지 않았습니다.")
+print("Validation 전체 완료:", list(summaries.keys()))
+for target_table, summary in summaries.items():
+    skipped = len(summary["relationship_rules_skipped"])
+    print(f"  {target_table:10s} 적재={summary['loaded_count']:>6}  격리={summary['quarantined_count']:>6}  "
+          f"미검증 FK={skipped}")
