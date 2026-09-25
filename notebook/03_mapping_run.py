@@ -265,35 +265,3 @@ if IS_CUSTOMER:
         print("  SAVE_CANDIDATE=False라 저장된 candidate가 없어 Integration을 실행하지 않았습니다.")
 else:
     print(f"TARGET_TABLE={TARGET_TABLE}: CUSTOMER가 아니므로 이 셀은 스킵합니다 (6번 셀까지가 이 Target의 전체 흐름입니다).")
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC select * from maps_databricks.gold_candidate.contract limit 10
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC SELECT COUNT(*) AS cnt
-# MAGIC FROM maps_databricks.gold_candidate.customer;
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC SELECT *
-# MAGIC FROM maps_databricks.meta.entity_integration_definition
-# MAGIC WHERE TARGET_ENTITY IN ('CUSTOMER', 'CONTRACT');
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC SELECT
-# MAGIC     APRV_YN,
-# MAGIC     COUNT(*) AS cnt
-# MAGIC FROM maps_databricks.gold_candidate.product_mapping
-# MAGIC GROUP BY APRV_YN;
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC select * from maps_databricks.gold_candidate.product limit 10

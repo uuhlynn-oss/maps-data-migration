@@ -117,26 +117,3 @@ if SAVE:
     print(f"\n{tables['gold_table']}: 이번 실행 적재분 {summary['loaded_count']}행 (테이블 전체 {gold_n.count()}행, 재실행 시 누적 - 알려진 제약)")
 else:
     print("SAVE=False: 저장하지 않았습니다.")
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC SELECT
-# MAGIC     c._source_record_key,
-# MAGIC     c.PRD_ID,
-# MAGIC     s.product_code
-# MAGIC FROM maps_databricks.gold_candidate.contract c
-# MAGIC LEFT JOIN maps_databricks.silver_candidate.inbound s
-# MAGIC     ON c._source_record_key = s._source_record_key
-# MAGIC WHERE c._source_record_key IN (
-# MAGIC     'CS202606020105',
-# MAGIC     'CS202606020294',
-# MAGIC     'CS202606020721',
-# MAGIC     'CS202606030048',
-# MAGIC     'CS202606030674',
-# MAGIC     'CS202606080293',
-# MAGIC     'CS202606090569',
-# MAGIC     'CS202606160101',
-# MAGIC     'CS202606160550',
-# MAGIC     'CS202606180050'
-# MAGIC );
