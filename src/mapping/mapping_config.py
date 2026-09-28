@@ -7,11 +7,21 @@ META_SCHEMA = "meta"
 GOLD_CANDIDATE_SCHEMA = "gold_candidate"
 GOLD_MAPPING_ERROR_SCHEMA = "gold_mapping_error"   # _map_errors IS NOT NULL 행 전용 (Gold Validation 입력에서 제외)
 GOLD_ENTITY_LINEAGE_SCHEMA = "gold_entity_lineage"   # Entity MERGE로 대표 행에서 탈락한 원본 lineage -> 최종 PK crosswalk
-SILVER_INPUT_SCHEMA = "silver_candidate"   # 정식 Silver 테이블이 생기면 여기만 바꾼다
+SILVER_INPUT_SCHEMA = "silver"   # DQ Review(Human Gate) 승인 결과가 반영되는 정식 Silver로 전환.
+# ⚠️ silver.<source>는 DQ Review에서 최근 승인된 배치 하나만 담고 있다(publish_release()가 전체
+# DELETE 후 그 배치만 INSERT). 아직 승인되지 않은 소스는 silver.<source>가 비어 있어, 아래 run()이
+# 에러 없이 0건짜리 결과를 만들 수 있다 - Job 순서/시점 설계 시 반드시 감안할 것.
 
 # ---- 엔진이 읽는 메타데이터 테이블 (mapping_seed_loader.py로 CSV에서 적재) ----
 TARGET_MODEL_TABLE = f"{UC_CATALOG}.{META_SCHEMA}.target_model"                    # TO-BE 물리 모델 (DA 확정본)
-MAPPING_DEFINITION_TABLE = f"{UC_CATALOG}.{META_SCHEMA}.mapping_definition"        # 컬럼 단위 Source -> Target 매핑
+# Mapping Rule 참조를 meta.mapping_definition에서 maps_review.approved_rule로 전환.
+# ⚠️ approved_rule은 아래 컬럼을 반드시 가지고 있어야 한다 (mapping_engine.py가 실제로 참조하는
+# 컬럼만 나열 - 확인된 것 외 추가 요구사항이 더 있을 수 있어 실행 전 스키마 대조가 필요하다):
+#   MAPPING_ID, SOURCE_SYSTEM, TARGET_TABLE, TARGET_COLUMN, TARGET_DATATYPE, SOURCE_COLUMN,
+#   MAPPING_TYPE, PROCESS_TYPE, FINAL_MIGRATION_APPLY_YN, REVIEW_STATUS, (선택) CODE_MAPPING_RULE
+# 카탈로그/스키마는 기존 명명 규칙(UC_CATALOG.<schema>.<table>)을 그대로 따른다고 가정했다 - 확인 필요.
+MAPPING_RULE_SCHEMA = "maps_review"
+MAPPING_DEFINITION_TABLE = f"{UC_CATALOG}.{MAPPING_RULE_SCHEMA}.approved_rule"
 CODE_MAPPING_TABLE = f"{UC_CATALOG}.{META_SCHEMA}.code_mapping_asis_tobe"          # AS-IS -> TO-BE 코드 변환표 (v1.1 최종)
 # ※ DQ 단계의 meta.code_mapping(CLN-VAL-003, 보류 중)과는 다른 테이블이다. 코드 변환의 정본은 이쪽이다.
 
@@ -104,10 +114,18 @@ SOURCE_SYSTEMS = {
 # PRODUCT_MAPPING은 여기 없다 - Silver -> run()을 거치는 Target이 아니라, PRODUCT_MAPPING_TABLE에 직접
 # 채워지는 크로스워크 참조 테이블이다(entity_integration_definition.csv/code_mapping_asis_tobe와 같은
 # 성격 - AI Mapping+사람 승인 결과가 쌓이는 곳). CONTRACT/COUNSEL의 PRD_ID FK Lookup이 이걸 조회한다.
-SUPPORTED_TARGET_TABLES = ("COUNSEL", "COMPLAINT", "CUSTOMER", "PRODUCT", "CONTRACT")
+SUPPORTED_TARGET_TABLES = ("COUNSEL", "COMPLAINT", "CUSTOMER", "CONTRACT") # PRODUCT 제외
 
 # 실행 대상 매핑 행 조건: FINAL_MIGRATION_APPLY_YN = 'Y' 이고 REVIEW_STATUS가 아래 중 하나
+# ⚠️ 이 상수는 entity_integration_definition(REVIEW_STATUS/FINAL_MIGRATION_APPLY_YN 컬럼을 그대로 쓰는
+# 별개 테이블 - mapping_engine._integration_spec(), mapping_orchestrator._lookup_integration_type()이
+# 참조)에서만 쓴다. approved_rule(Mapping Rule 참조)의 rule_status 필터는 아래 APPROVED_RULE_STATUSES를
+# 대신 쓴다 - 값 체계 자체가 다르기 때문에 이 상수를 공유하지 않는다.
 APPLY_REVIEW_STATUSES = ("APPROVED", "MODIFIED_APPROVED")
+
+# maps_review.approved_rule 전용. rule_status 실제 값은 ACTIVE(현재 유효) / SUPERSEDED(과거 버전으로 대체됨)
+# 뿐이다. Mapping 실행 대상은 ACTIVE만이며 SUPERSEDED는 제외한다.
+APPROVED_RULE_STATUSES = ("ACTIVE",)
 
 # integrate()가 허용하는 MATCHING_RULE 이름 화이트리스트. 실제 매칭 알고리즘은 이름과 무관하게
 # MATCHING_KEY_COLUMNS 전체 컬럼의 완전일치(EXACT) 하나뿐이라, 이 튜플은 로직을 분기하지 않고 "정의가

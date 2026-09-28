@@ -33,7 +33,7 @@ target_model에 있는 이름이 전부 실행 대상이어야 하지만, COUNSE
 구조. discover_execution_targets()는 SUPPORTED_TARGET_TABLES에 이미 나열된 순서(CUSTOMER가 CONTRACT보다
 앞에 오도록 기존에 정의돼 있음)를 그대로 물려받을 뿐, 새로운 순서 계산 로직을 추가하지 않는다.
 """
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -45,6 +45,35 @@ except ModuleNotFoundError:
 
 
 SUPPORTED_INTEGRATION_TYPES = ("DIRECT", "ENTITY", "MASTER")
+
+
+def assert_all_targets_ready(spark: SparkSession) -> None:
+    """Mapping Execution 시작 전 사전조건 검증.
+
+    cfg.SUPPORTED_TARGET_TABLES(COUNSEL/COMPLAINT/CUSTOMER/PRODUCT/CONTRACT) 전체가
+    maps_review.approved_rule에 ACTIVE(cfg.APPROVED_RULE_STATUSES) 행을 최소 1개씩 가지고
+    있어야 한다. 하나라도 없으면 어떤 Target도 실행하지 않고 여기서 즉시 멈춘다 - 일부만
+    준비된 상태로 부분 실행되거나(SKIP), 나중에 자동으로 다시 시도되는 일은 없다.
+
+    mapping_engine.py의 discover_sources()/_load_definitions()와 같은 조건(rule_status
+    ACTIVE, target_table 대소문자·공백 무시)을 쓰지만, "Target 하나가 실행 가능한가"가 아니라
+    "전체가 다 준비됐는가"를 미리 한 번에 확인하는 게 목적이라, 이 파일의 기존 원칙(private
+    메서드 재사용 없이 필요한 조회는 여기서 직접 함)대로 mapping_engine.py를 호출하지 않고
+    approved_rule을 직접 조회한다."""
+    rows = (
+        spark.read.table(cfg.MAPPING_DEFINITION_TABLE)
+        .filter(F.upper(F.trim(F.col("rule_status"))).isin(*cfg.APPROVED_RULE_STATUSES))
+        .select(F.upper(F.trim(F.col("target_table"))).alias("t"))
+        .distinct().collect()
+    )
+    ready = {r["t"] for r in rows}
+    missing = [t for t in cfg.SUPPORTED_TARGET_TABLES if t not in ready]
+    if missing:
+        raise ValueError(
+            "Mapping Execution을 시작할 수 없습니다.\n"
+            "다음 Target Model의 ACTIVE approved_rule이 준비되지 않았습니다:\n"
+            + ", ".join(missing)
+        )
 
 
 def discover_execution_targets(spark: SparkSession) -> List[str]:
@@ -145,7 +174,7 @@ def _master_params(spark: SparkSession, target_table: str) -> Dict[str, str]:
     return {"id_column": id_column, "key_column": key_column, "prefix": prefix}
 
 
-def run_target(engine, target_table: str) -> Dict[str, Any]:
+def run_target(engine, target_table: str, job_run_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Target 하나에 대해 discover_sources() -> source별 run() -> (DIRECT/ENTITY는 save()) ->
     (ENTITY는 전체 source 처리 후 integrate() 1회 / MASTER는 target_model 기반 load_master_data() 1회)
@@ -173,7 +202,7 @@ def run_target(engine, target_table: str) -> Dict[str, Any]:
     last_candidate = None
     last_summary = None
     for source_system in sources:
-        candidate, summary = engine.run(source_system, target_table)
+        candidate, summary = engine.run(source_system, target_table, job_run_id=job_run_id)
         last_candidate, last_summary = candidate, summary
 
         if integration_type in ("DIRECT", "ENTITY"):

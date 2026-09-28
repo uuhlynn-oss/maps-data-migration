@@ -174,7 +174,8 @@ class TargetValidator:
     def from_tables(cls, spark: SparkSession) -> "TargetValidator":
         return cls(spark, spark.read.table(cfg.TARGET_MODEL_TABLE))
 
-    def run(self, target_table: str, candidate: Optional[DataFrame] = None) -> Tuple[DataFrame, DataFrame, Dict[str, Any]]:
+    def run(self, target_table: str, candidate: Optional[DataFrame] = None,
+            job_run_id: Optional[str] = None) -> Tuple[DataFrame, DataFrame, Dict[str, Any]]:
         """
         candidate를 주지 않으면 gold_candidate.<target> 물리 테이블을 읽는다 (mapping_engine.save()가 저장한 것 — 소스별
         (source, batch) 단위로 갱신되므로 이미 실행된 모든 소스가 합쳐진 상태로 보인다. 다른 노트북/세션에서 실행해도 이어진다).
@@ -221,9 +222,11 @@ class TargetValidator:
         run_id = f"VAL-{datetime.now():%Y%m%d%H%M%S}-{target_table.lower()}-{uuid4().hex[:6]}"
 
         passed = rechecked.filter(F.col("_violations").isNull()).select(
-            *target_cols, *_LINEAGE_COLS, F.lit(run_id).alias("_validation_run_id"))
+            *target_cols, *_LINEAGE_COLS, F.lit(run_id).alias("_validation_run_id"),
+            F.lit(job_run_id).alias("_job_run_id"))
         failed = rechecked.filter(F.col("_violations").isNotNull()).select(
-            *target_cols, *_LINEAGE_COLS, "_violations", F.lit(run_id).alias("_validation_run_id"))
+            *target_cols, *_LINEAGE_COLS, "_violations", F.lit(run_id).alias("_validation_run_id"),
+            F.lit(job_run_id).alias("_job_run_id"))
 
         input_count = candidate.count()
         pass_count, fail_count = passed.count(), failed.count()
@@ -231,7 +234,7 @@ class TargetValidator:
                       failed.select(F.explode(F.split("_violations", ",")).alias("v"))
                       .groupBy("v").agg(F.count("*").alias("cnt")).collect()}
         summary = {
-            "validation_run_id": run_id, "target_table": target_table, "pk_column": pk_column,
+            "validation_run_id": run_id, "job_run_id": job_run_id, "target_table": target_table, "pk_column": pk_column,
             "input_count": input_count, "loaded_count": pass_count, "quarantined_count": fail_count,
             "reconciled": input_count == pass_count + fail_count,   # VR-COUNSEL-024
             "violations_by_rule": viol_counts,
@@ -249,13 +252,28 @@ class TargetValidator:
         self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS {cfg.UC_CATALOG}.{cfg.GOLD_SCHEMA}")
         self.spark.sql(f"CREATE SCHEMA IF NOT EXISTS {cfg.UC_CATALOG}.{cfg.GOLD_QUARANTINE_SCHEMA}")
 
-        # Gold Target: TO-BE 모델 그대로, 원천 계보 컬럼 없음. 배치 식별자가 없어 replaceWhere를 못 쓰므로 추가만 한다
-        # (같은 배치를 재실행하면 중복 적재된다 - 알려진 제약, 3차에서 MIGRATION_TRACE 기준 멱등 적재로 보완 예정).
+        # Gold Target: TO-BE 모델 그대로였으나, Run 단위 추적을 위해 _validation_run_id 하나만 남긴다
+        # (9번 검토사항). PK 기준으로 기존 레코드를 지우고 다시 쓰는 방식(4번 검토사항 - 근본 해결책)으로
+        # 전환했다: 재실행이든 규칙 수정 후 재처리든, 매번 "이 PK들을 최신 내용으로 치환한다"는 동일한
+        # 규칙만 적용되므로 별도의 "이미 처리됐는지" 사전 판단이 필요 없어진다. 5개 Target 전부 단일
+        # 컬럼 PK임을 사전에 target_model로 확인했다 - derive_rules()의 pk_column은 KEY='PK'인 첫
+        # 컬럼 하나만 반환하므로, 복합키 Target이 새로 추가되면 이 로직을 다시 검토해야 한다.
         target_cols = [c for c in passed.columns if not c.startswith("_")]
-        gold_out = passed.select(*target_cols)
+        gold_out = passed.select(*target_cols, "_validation_run_id", "_job_run_id")
+        pk = summary.get("pk_column")
         if not self.spark.catalog.tableExists(gold_t):
             gold_out.limit(0).write.format("delta").mode("overwrite").saveAsTable(gold_t)
-        gold_out.write.format("delta").mode("append").saveAsTable(gold_t)
+        elif pk:
+            # 이번 배치의 PK 값들을 먼저 지운다 - DELETE~INSERT 사이 원자성은 없다(짧은 공백 구간 존재,
+            # 현재 이 테이블을 실시간으로 읽는 화면이 없어 위험도는 낮음). pk_column이 없는 경우(모델에
+            # KEY='PK' 표기가 없는 예외적 상황)는 이 삭제를 건너뛰고 기존과 같이 append만 한다.
+            pk_values = [r[0] for r in gold_out.select(pk).distinct().collect()]
+            if pk_values:
+                quoted = ", ".join("'" + str(v).replace("'", "''") + "'" for v in pk_values)
+                self.spark.sql(f"DELETE FROM {gold_t} WHERE {pk} IN ({quoted})")
+        # mergeSchema: 기존 gold.<target>에 이미 데이터가 있어도(_validation_run_id 컬럼이 없던 과거 행 포함)
+        # 새 컬럼을 추가하며 쓸 수 있게 한다.
+        gold_out.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(gold_t)
 
         # gold_quarantine: 원천 계보가 있으므로 (소스, 배치) 단위로 교체한다 (Mapping Engine의 save()와 같은 방식)
         if not self.spark.catalog.tableExists(quarantine_t):

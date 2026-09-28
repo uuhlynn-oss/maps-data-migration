@@ -17,6 +17,17 @@
 
 # COMMAND ----------
 
+# MAGIC %md ## 0. Job Run ID 수신
+# MAGIC Job 설정의 base_parameters(`job_run_id`: `{{job.run_id}}`)로 전달된 값을 읽는다. 대화형으로
+# MAGIC 직접 실행하면(Job 없이) 빈 값이 들어오고, 아래에서 None으로 처리해 그대로 진행한다.
+
+# COMMAND ----------
+
+dbutils.widgets.text("job_run_id", "")
+job_run_id = dbutils.widgets.get("job_run_id") or None
+
+# COMMAND ----------
+
 import os
 import sys
 
@@ -36,6 +47,17 @@ except ModuleNotFoundError:
     import mapping_orchestrator as orch
 
 engine = engine_mod.MappingEngine.from_tables(spark)
+
+# COMMAND ----------
+
+# MAGIC %md ## 0. 사전조건 검증: 전체 Target Model의 ACTIVE approved_rule 준비 여부
+# MAGIC SUPPORTED_TARGET_TABLES 중 하나라도 준비되지 않았으면 여기서 멈춘다 - 일부 Target만
+# MAGIC 실행하거나 건너뛰지 않는다.
+
+# COMMAND ----------
+
+orch.assert_all_targets_ready(spark)
+print("✅ 전체 Target Model의 ACTIVE approved_rule이 준비되었습니다. Mapping Execution을 시작합니다.")
 
 # COMMAND ----------
 
@@ -60,7 +82,7 @@ if not targets:
 results = {}
 for target_table in targets:
     print(f"\n{'=' * 60}\n[{target_table}] Mapping Execution 시작\n{'=' * 60}")
-    result = orch.run_target(engine, target_table)
+    result = orch.run_target(engine, target_table, job_run_id=job_run_id)
     results[target_table] = result
 
     print(f"integration_type = {result['integration_type']}")

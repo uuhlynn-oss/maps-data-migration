@@ -103,6 +103,39 @@ def _join_when(parts: List[Column]) -> Column:
     return F.when(F.length(joined) > 0, joined)
 
 
+# maps_review.approved_rule의 실제 컬럼명(소문자, 일부는 이름도 다름)을 이 파일이 기존에 쓰던 대문자
+# 키로 맞춘다 - 이 한 곳에서만 alias하고, 아래 _load_definitions/_validate/discover_sources 등
+# 수십 곳의 d["MAPPING_ID"] 같은 접근은 손대지 않는다. Spark의 F.col()은 대소문자를 구분하지 않지만,
+# .asDict()로 만든 Python dict의 key는 원본 대소문자 그대로 남아 그 접근들이 그대로는 깨진다.
+# FINAL_MIGRATION_APPLY_YN/TARGET_DATATYPE은 approved_rule에 대응 컬럼이 없어 alias하지 않는다 -
+# 그 부재는 _load_definitions/discover_sources/_validate에서 각각 직접 처리한다.
+_APPROVED_RULE_ALIASES = {
+    "rule_id": "MAPPING_ID",
+    "rule_version": "VERSION",   # 529~530행 mapping_version 계산에서 d['VERSION']으로 참조
+    "source_system": "SOURCE_SYSTEM",
+    "target_table": "TARGET_TABLE",
+    "target_column": "TARGET_COLUMN",
+    "source_column": "SOURCE_COLUMN",
+    "mapping_type": "MAPPING_TYPE",
+    "process_type": "PROCESS_TYPE",
+    "code_mapping_rule": "CODE_MAPPING_RULE",
+    # rule_status 필터는 cfg.APPROVED_RULE_STATUSES(ACTIVE만 허용, SUPERSEDED 제외)를 쓴다 -
+    # cfg.APPLY_REVIEW_STATUSES(APPROVED/MODIFIED_APPROVED)와는 값 체계가 다른 별개 상수다.
+    "rule_status": "REVIEW_STATUS",
+}
+
+
+def _apply_mapping_rule_aliases(df: DataFrame) -> DataFrame:
+    """approved_rule -> 이 엔진이 기대하는 컬럼명으로 별칭만 붙인다. 별칭 대상이 아닌 원본 컬럼
+    (review_id, query_id, rule_version, source_schema, target_schema, transformation_rule,
+    approved_by, approved_at, effective_from, effective_to)은 그대로 남긴다 - 이 엔진이 지금 쓰지
+    않을 뿐 데이터를 버리는 게 아니다."""
+    existing = set(df.columns)
+    aliased = [F.col(src).alias(dst) for src, dst in _APPROVED_RULE_ALIASES.items() if src in existing]
+    passthrough = [F.col(c) for c in df.columns if c not in _APPROVED_RULE_ALIASES]
+    return df.select(*aliased, *passthrough)
+
+
 class MappingEngine:
     def __init__(self, spark: SparkSession, target_model_df: DataFrame,
                  mapping_def_df: DataFrame, code_map_df: DataFrame):
@@ -117,7 +150,7 @@ class MappingEngine:
         return cls(
             spark,
             spark.read.table(cfg.TARGET_MODEL_TABLE),
-            spark.read.table(cfg.MAPPING_DEFINITION_TABLE),
+            _apply_mapping_rule_aliases(spark.read.table(cfg.MAPPING_DEFINITION_TABLE)),
             spark.read.table(cfg.CODE_MAPPING_TABLE),
         )
 
@@ -160,12 +193,14 @@ class MappingEngine:
     def _load_definitions(self, source_system: str, target_table: str) -> List[Dict[str, Any]]:
         # mapping_seed_loader.py가 적재 시 MAPPING_ID 중복을 이미 거부하므로, 여기서는 버전 선택 없이 그대로 모은다.
         # (mapping_definition이 dq_rule_def처럼 진짜 버전 관리 테이블이 되면, 그때 "최신 버전만 선택"을 다시 넣는다.)
+        # approved_rule에는 FINAL_MIGRATION_APPLY_YN에 대응하는 컬럼이 없어 그 필터는 제거했다 - REVIEW_STATUS
+        # (원본 rule_status) 필터만으로 승인 여부를 가른다. approved_rule 자체가 이미 승인된 행만 담고 있다는
+        # 전제인지는 확인이 필요하다.
         df = (
             self._defs
             .filter(F.upper(F.trim(F.col("SOURCE_SYSTEM"))) == source_system.upper())
             .filter(F.upper(F.trim(F.col("TARGET_TABLE"))) == target_table.upper())
-            .filter(F.upper(F.trim(F.col("FINAL_MIGRATION_APPLY_YN"))) == "Y")
-            .filter(F.upper(F.trim(F.col("REVIEW_STATUS"))).isin(*cfg.APPLY_REVIEW_STATUSES))
+            .filter(F.upper(F.trim(F.col("REVIEW_STATUS"))).isin(*cfg.APPROVED_RULE_STATUSES))
         )
         defs = [{k: (v.strip() if isinstance(v, str) else v) for k, v in r.asDict().items()} for r in df.collect()]
         return sorted(defs, key=lambda d: d["MAPPING_ID"])
@@ -201,7 +236,7 @@ class MappingEngine:
             t = d["TARGET_COLUMN"]
             if t not in by_name:
                 errors.append(f"{d['MAPPING_ID']}: Target 컬럼 '{t}'이(가) TO-BE 모델에 없음")
-            elif _norm_type(d["TARGET_DATATYPE"]) != _norm_type(by_name[t]["DATA_TYPE"]):
+            elif "TARGET_DATATYPE" in d and _norm_type(d["TARGET_DATATYPE"]) != _norm_type(by_name[t]["DATA_TYPE"]):
                 errors.append(f"{d['MAPPING_ID']}: 타입 불일치 (매핑 {d['TARGET_DATATYPE']} / 모델 {by_name[t]['DATA_TYPE']})")
             if t in seen:
                 errors.append(f"Target 컬럼 '{t}'에 매핑이 둘 이상: {seen[t]}, {d['MAPPING_ID']}")
@@ -324,11 +359,15 @@ class MappingEngine:
 
         정렬은 알파벳순이 아니라 mapping_definition.TARGET_LOAD_ORDER 기준이다 (10 상품/코드, 20 CUSTOMER, 30 CONTRACT,
         40 COUNSEL, ...). CONTRACT가 CUSTOMER를 NOT NULL FK로 참조하는 등 Target 간 참조 관계가 있어서, 알파벳순으로
-        돌리면(CONTRACT가 CUSTOMER보다 먼저) 부모가 없는 상태에서 자식을 실행하게 된다."""
+        돌리면(CONTRACT가 CUSTOMER보다 먼저) 부모가 없는 상태에서 자식을 실행하게 된다.
+
+        ⚠️ 03_mapping_run.py는 이 메서드가 아니라 mapping_orchestrator.discover_execution_targets()
+        (target_model 기준)를 쓰므로, 현재 실행 경로에서는 이 메서드가 호출되지 않는다. approved_rule에는
+        TARGET_LOAD_ORDER에 대응하는 컬럼이 없어(별도 설계 필요) 지금 이 메서드를 호출하면 여전히 실패한다 -
+        미사용 경로라 이번 변경 범위에서는 그대로 남겨둔다."""
         rows = (
             self._defs
-            .filter(F.upper(F.trim(F.col("FINAL_MIGRATION_APPLY_YN"))) == "Y")
-            .filter(F.upper(F.trim(F.col("REVIEW_STATUS"))).isin(*cfg.APPLY_REVIEW_STATUSES))
+            .filter(F.upper(F.trim(F.col("REVIEW_STATUS"))).isin(*cfg.APPROVED_RULE_STATUSES))
             .select(F.upper(F.trim(F.col("TARGET_TABLE"))).alias("t"), F.col("TARGET_LOAD_ORDER").alias("o"))
             .distinct().collect()
         )
@@ -342,21 +381,20 @@ class MappingEngine:
         return sorted(supported, key=lambda t: (order_by_target[t], t))
 
     def discover_sources(self, target_table: str) -> List[str]:
-        """이 Target으로 승인된 매핑(FINAL_MIGRATION_APPLY_YN=Y, REVIEW_STATUS 승인)이 있는 소스 목록을 meta.mapping_definition에서
+        """이 Target으로 승인된 매핑(REVIEW_STATUS 승인)이 있는 소스 목록을 meta.mapping_definition에서
         확정한다. 노트북에 소스를 하드코딩하지 않고, 정의가 바뀌면(새 소스 추가·제외) 이 목록도 같이 바뀌게 하기 위함."""
         target_table = target_table.upper()
         rows = (
             self._defs
             .filter(F.upper(F.trim(F.col("TARGET_TABLE"))) == target_table)
-            .filter(F.upper(F.trim(F.col("FINAL_MIGRATION_APPLY_YN"))) == "Y")
-            .filter(F.upper(F.trim(F.col("REVIEW_STATUS"))).isin(*cfg.APPLY_REVIEW_STATUSES))
+            .filter(F.upper(F.trim(F.col("REVIEW_STATUS"))).isin(*cfg.APPROVED_RULE_STATUSES))
             .select(F.upper(F.trim(F.col("SOURCE_SYSTEM"))).alias("s")).distinct().collect()
         )
         found = {r["s"] for r in rows}
         return sorted(s for s in cfg.SOURCE_SYSTEMS if s in found)   # SOURCE_SYSTEMS에 등록된 순서를 따른다 (안정적인 실행 순서)
 
     def run(self, source_system: str, target_table: str, silver_df: Optional[DataFrame] = None,
-            source_batch_id: Optional[str] = None) -> Tuple[DataFrame, Dict[str, Any]]:
+            source_batch_id: Optional[str] = None, job_run_id: Optional[str] = None) -> Tuple[DataFrame, Dict[str, Any]]:
         """
         Silver -> gold_candidate 변환 (저장하지 않고 DataFrame과 summary를 돌려준다. 저장은 save()).
         silver_df를 주지 않으면 silver_candidate.<source>에서 source_batch_id(미지정 시 최신 배치)를 읽는다.
@@ -381,7 +419,7 @@ class MappingEngine:
         defs = self._load_definitions(source_system, target_table)
         if not defs:
             raise ValueError(f"실행할 Mapping Definition이 없습니다 ({source_system} -> {target_table}). "
-                             f"FINAL_MIGRATION_APPLY_YN = 'Y' 이고 REVIEW_STATUS가 {cfg.APPLY_REVIEW_STATUSES}인 행이 필요합니다.")
+                             f"REVIEW_STATUS가 {cfg.APPROVED_RULE_STATUSES}인 행이 필요합니다.")
         self._validate(defs, target_cols, silver_df)
 
         ctx = {
@@ -501,6 +539,7 @@ class MappingEngine:
             F.lit(run_id).alias("_mapping_run_id"),
             F.lit(mapping_version).alias("_mapping_version"),
             F.lit(datetime.now()).alias("_mapped_at"),
+            F.lit(job_run_id).alias("_job_run_id"),
             _join_when(error_parts).alias("_map_errors"),
             _join_when(unmapped_parts).alias("_unmapped_codes"),
         )

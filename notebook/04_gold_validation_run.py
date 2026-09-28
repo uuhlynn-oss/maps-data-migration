@@ -44,6 +44,16 @@ validator = gv.TargetValidator.from_tables(spark)
 
 # COMMAND ----------
 
+# MAGIC %md ## 0-1. Job Run ID 수신
+# MAGIC Job 설정의 base_parameters(`job_run_id`: `{{job.run_id}}`)로 전달된 값을 읽는다.
+
+# COMMAND ----------
+
+dbutils.widgets.text("job_run_id", "")
+job_run_id = dbutils.widgets.get("job_run_id") or None
+
+# COMMAND ----------
+
 # MAGIC %md ## 1. 검증 대상 자동 조회
 # MAGIC Mapping Execution과 동일한 목록(target_model ∩ SUPPORTED_TARGET_TABLES)을 그대로 쓴다.
 
@@ -67,7 +77,13 @@ for target_table in targets:
         print(f"⚠️  {candidate_table} 없음 - 03_mapping_run.py를 먼저 실행하세요. 이 Target은 건너뜁니다.")
         continue
 
-    passed, failed, summary = validator.run(target_table)
+    # gold.<target>이 PK 기준 DELETE+INSERT(gold_validation_runner.py::save())로 저장되므로,
+    # 재실행이든 규칙 수정 후 재처리든 항상 안전하게 최신 내용으로 치환된다 - 이전에 있던
+    # migration_trace 기반 "이미 처리된 배치 skip" 로직은 더 이상 필요 없어 제거했다(오히려
+    # 남겨두면 규칙을 고친 뒤 재처리하려 해도 여기서 걸러져 validator.run()이 호출되지 않는
+    # 문제가 있었다).
+
+    passed, failed, summary = validator.run(target_table, job_run_id=job_run_id)
     summaries[target_table] = summary
 
     match = summary["input_count"] == summary["loaded_count"] + summary["quarantined_count"]
